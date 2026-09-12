@@ -14,53 +14,47 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      - name: Checkout v0.4.6
+      - name: Checkout BeeLlama v0.4.6
         shell: pwsh
         run: |
           git fetch --tags --force
           git checkout v0.4.6
           git submodule update --init --recursive
 
-          Write-Host "Checked out:"
+          Write-Host "Version:"
           git describe --tags --always
+
+          Write-Host "Commit:"
           git rev-parse HEAD
 
-      - name: Patch Codex Responses output_text support
+
+      # ------------------------------------------------------------
+      # Codex Responses API compatibility fix
+      #
+      # Before:
+      #   input_text only
+      #
+      # After:
+      #   input_text OR output_text
+      # ------------------------------------------------------------
+      - name: Patch Codex output_text support
         shell: pwsh
         run: |
           $path = "tools/server/server-chat.cpp"
 
           if (-not (Test-Path $path)) {
-              Write-Error "$path not found"
+              Write-Error "File not found: $path"
               exit 1
           }
 
           $content = Get-Content $path -Raw
 
-          $old1 = @'
-          if (!chatcmpl_output.contains("type") || chatcmpl_output.at("type") != "input_text") {
-              throw std::invalid_argument("Output of tool call should be 'Input text'");
-          }
-          '@
+          Write-Host "Searching patch target..."
 
-          $new1 = @'
-          if (!chatcmpl_output.contains("type") ||
-              (chatcmpl_output.at("type") != "input_text" &&
-               chatcmpl_output.at("type") != "output_text")) {
-              throw std::invalid_argument("Output of tool call should be 'input_text' or 'output_text'");
-          }
-          '@
-
-          if ($content.Contains($old1)) {
-              $content = $content.Replace($old1, $new1)
-              Set-Content -Path $path -Value $content -NoNewline
-
-              Write-Host "Codex output_text patch applied."
-              git diff -- $path
-              exit 0
-          }
-
-          Write-Host "Exact multiline pattern not found. Trying regex patch."
+          Select-String `
+              -Path $path `
+              -Pattern "Output of tool call|input_text" `
+              -Context 5,5
 
           $pattern = 'if\s*\(\s*!chatcmpl_output\.contains\("type"\)\s*\|\|\s*chatcmpl_output\.at\("type"\)\s*!=\s*"input_text"\s*\)\s*\{\s*throw\s+std::invalid_argument\("Output of tool call should be ''Input text''"\);\s*\}'
 
@@ -68,7 +62,8 @@ jobs:
           if (!chatcmpl_output.contains("type") ||
               (chatcmpl_output.at("type") != "input_text" &&
                chatcmpl_output.at("type") != "output_text")) {
-              throw std::invalid_argument("Output of tool call should be 'input_text' or 'output_text'");
+              throw std::invalid_argument(
+                  "Output of tool call should be 'input_text' or 'output_text'");
           }
           '@
 
@@ -80,47 +75,105 @@ jobs:
           )
 
           if ($patched -eq $content) {
-              Write-Host "Patch target around Input text:"
-              Select-String -Path $path -Pattern "Output of tool call|input_text" -Context 5,5
-
-              Write-Error "Patch target not found. Build aborted to avoid producing an unpatched binary."
+              Write-Error "Codex patch target was not found."
               exit 1
           }
 
-          Set-Content -Path $path -Value $patched -NoNewline
+          Set-Content `
+              -Path $path `
+              -Value $patched `
+              -NoNewline `
+              -Encoding UTF8
 
-          Write-Host "Codex output_text regex patch applied."
+          Write-Host ""
+          Write-Host "Patch applied:"
           git diff -- $path
 
-      - name: Verify patch
+
+      - name: Verify Codex patch
         shell: pwsh
         run: |
           $path = "tools/server/server-chat.cpp"
           $content = Get-Content $path -Raw
 
           if (-not $content.Contains('"output_text"')) {
-              Write-Error "output_text support not found after patch."
+              Write-Error "output_text was not found after patch."
               exit 1
           }
 
-          Write-Host "Patch verification OK."
-          Select-String -Path $path -Pattern "output_text" -Context 3,3
+          Write-Host "Codex patch verification OK."
 
-      - name: Setup CUDA 13.3
-        uses: Jimver/cuda-toolkit@v0.2.30
-        with:
-          cuda: '13.3.0'
-          method: network
+          Select-String `
+              -Path $path `
+              -Pattern "output_text" `
+              -Context 4,4
 
-      - name: Show CUDA
+
+      # ------------------------------------------------------------
+      # Install CUDA 13.3 directly from NVIDIA
+      # ------------------------------------------------------------
+      - name: Download CUDA 13.3 installer
         shell: pwsh
         run: |
+          $url = "https://developer.download.nvidia.com/compute/cuda/13.3.0/network_installers/cuda_13.3.0_windows_network.exe"
+
+          Write-Host "Downloading:"
+          Write-Host $url
+
+          Invoke-WebRequest `
+              -Uri $url `
+              -OutFile "$env:RUNNER_TEMP\cuda-installer.exe"
+
+
+      - name: Install CUDA 13.3
+        shell: pwsh
+        run: |
+          $installer = "$env:RUNNER_TEMP\cuda-installer.exe"
+
+          Start-Process `
+              -FilePath $installer `
+              -ArgumentList "-s nvcc_13.3 cudart_13.3" `
+              -Wait `
+              -NoNewWindow
+
+          $cuda = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
+
+          if (-not (Test-Path "$cuda\bin\nvcc.exe")) {
+              Write-Error "CUDA installation failed: nvcc.exe not found"
+              exit 1
+          }
+
+          "CUDA_PATH=$cuda" >> $env:GITHUB_ENV
+          "$cuda\bin" >> $env:GITHUB_PATH
+
+
+      - name: Verify CUDA
+        shell: pwsh
+        run: |
+          Write-Host "CUDA_PATH=$env:CUDA_PATH"
+
           nvcc --version
 
+          if (-not (Test-Path "$env:CUDA_PATH\bin\nvcc.exe")) {
+              Write-Error "nvcc verification failed."
+              exit 1
+          }
+
+
+      # ------------------------------------------------------------
+      # Configure BeeLlama
+      #
+      # RTX 4070 Ti SUPER = Ada / sm_89
+      #
+      # ALL_QUANTS is intentionally ON because your runtime uses
+      # KVarN cache combinations.
+      # ------------------------------------------------------------
       - name: Configure CMake
         shell: pwsh
         run: |
-          cmake -B build `
+          cmake `
+            -S . `
+            -B build `
             -DGGML_CUDA=ON `
             -DGGML_NATIVE=OFF `
             -DGGML_CUDA_FA=ON `
@@ -128,52 +181,116 @@ jobs:
             -DCMAKE_CUDA_ARCHITECTURES=89 `
             -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build
+
+      - name: Build BeeLlama
         shell: pwsh
         run: |
-          cmake --build build --config Release --parallel
+          cmake `
+            --build build `
+            --config Release `
+            --parallel
 
-      - name: Show build output
+
+      - name: Show binaries
         shell: pwsh
         run: |
-          Get-ChildItem build\bin\Release
+          Write-Host "Build output:"
 
-      - name: Package binaries
+          Get-ChildItem `
+              build\bin\Release `
+              -File
+
+
+      # ------------------------------------------------------------
+      # Package
+      # ------------------------------------------------------------
+      - name: Create package
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force package | Out-Null
+          $package = "package"
 
-          Copy-Item build\bin\Release\*.exe package\ -ErrorAction SilentlyContinue
-          Copy-Item build\bin\Release\*.dll package\ -ErrorAction SilentlyContinue
+          New-Item `
+              -ItemType Directory `
+              -Path $package `
+              -Force |
+              Out-Null
+
+          Copy-Item `
+              build\bin\Release\*.exe `
+              $package `
+              -ErrorAction SilentlyContinue
+
+          Copy-Item `
+              build\bin\Release\*.dll `
+              $package `
+              -ErrorAction SilentlyContinue
+
 
           git rev-parse HEAD |
-              Out-File package\source-commit.txt -Encoding ascii
+              Out-File `
+                  "$package\source-commit.txt" `
+                  -Encoding ascii
 
           git describe --tags --always |
-              Out-File package\source-version.txt -Encoding ascii
+              Out-File `
+                  "$package\source-version.txt" `
+                  -Encoding ascii
 
           git diff |
-              Out-File package\codex-output-text-fix.patch -Encoding utf8
+              Out-File `
+                  "$package\codex-output-text-fix.patch" `
+                  -Encoding utf8
+
 
           @"
-          BeeLlama source: v0.4.6
-          CUDA: 13.3
-          CUDA architecture: sm_89
-          GGML_CUDA_FA: ON
-          GGML_CUDA_FA_ALL_QUANTS: ON
-          GGML_NATIVE: OFF
+          BeeLlama Codex compatibility build
 
-          Codex Responses compatibility patch:
-          Accept both input_text and output_text in function_call_output.
-          "@ | Out-File package\BUILD-INFO.txt -Encoding utf8
+          Source:
+          BeeLlama v0.4.6
+
+          Platform:
+          Windows x64
+
+          CUDA:
+          13.3
+
+          CUDA architecture:
+          sm_89
+          RTX 40 series / Ada
+
+          CMake:
+          GGML_CUDA=ON
+          GGML_CUDA_FA=ON
+          GGML_CUDA_FA_ALL_QUANTS=ON
+          GGML_NATIVE=OFF
+
+          Codex Responses API patch:
+
+          function_call_output accepts:
+
+          input_text
+          output_text
+
+          Purpose:
+
+          Fixes:
+
+          HTTP 400
+          Output of tool call should be 'Input text'
+          "@ |
+              Out-File `
+                  "$package\BUILD-INFO.txt" `
+                  -Encoding utf8
+
 
       - name: Create ZIP
         shell: pwsh
         run: |
           Compress-Archive `
-            -Path package\* `
-            -DestinationPath beellama-v0.4.6-codex-fix-cuda13.3-sm89.zip `
-            -Force
+              -Path package\* `
+              -DestinationPath "beellama-v0.4.6-codex-fix-cuda13.3-sm89.zip" `
+              -Force
+
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
