@@ -1,0 +1,183 @@
+name: Build BeeLlama v0.4.6 Codex Fix
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2025
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Checkout v0.4.6
+        shell: pwsh
+        run: |
+          git fetch --tags --force
+          git checkout v0.4.6
+          git submodule update --init --recursive
+
+          Write-Host "Checked out:"
+          git describe --tags --always
+          git rev-parse HEAD
+
+      - name: Patch Codex Responses output_text support
+        shell: pwsh
+        run: |
+          $path = "tools/server/server-chat.cpp"
+
+          if (-not (Test-Path $path)) {
+              Write-Error "$path not found"
+              exit 1
+          }
+
+          $content = Get-Content $path -Raw
+
+          $old1 = @'
+          if (!chatcmpl_output.contains("type") || chatcmpl_output.at("type") != "input_text") {
+              throw std::invalid_argument("Output of tool call should be 'Input text'");
+          }
+          '@
+
+          $new1 = @'
+          if (!chatcmpl_output.contains("type") ||
+              (chatcmpl_output.at("type") != "input_text" &&
+               chatcmpl_output.at("type") != "output_text")) {
+              throw std::invalid_argument("Output of tool call should be 'input_text' or 'output_text'");
+          }
+          '@
+
+          if ($content.Contains($old1)) {
+              $content = $content.Replace($old1, $new1)
+              Set-Content -Path $path -Value $content -NoNewline
+
+              Write-Host "Codex output_text patch applied."
+              git diff -- $path
+              exit 0
+          }
+
+          Write-Host "Exact multiline pattern not found. Trying regex patch."
+
+          $pattern = 'if\s*\(\s*!chatcmpl_output\.contains\("type"\)\s*\|\|\s*chatcmpl_output\.at\("type"\)\s*!=\s*"input_text"\s*\)\s*\{\s*throw\s+std::invalid_argument\("Output of tool call should be ''Input text''"\);\s*\}'
+
+          $replacement = @'
+          if (!chatcmpl_output.contains("type") ||
+              (chatcmpl_output.at("type") != "input_text" &&
+               chatcmpl_output.at("type") != "output_text")) {
+              throw std::invalid_argument("Output of tool call should be 'input_text' or 'output_text'");
+          }
+          '@
+
+          $patched = [regex]::Replace(
+              $content,
+              $pattern,
+              $replacement,
+              [System.Text.RegularExpressions.RegexOptions]::Singleline
+          )
+
+          if ($patched -eq $content) {
+              Write-Host "Patch target around Input text:"
+              Select-String -Path $path -Pattern "Output of tool call|input_text" -Context 5,5
+
+              Write-Error "Patch target not found. Build aborted to avoid producing an unpatched binary."
+              exit 1
+          }
+
+          Set-Content -Path $path -Value $patched -NoNewline
+
+          Write-Host "Codex output_text regex patch applied."
+          git diff -- $path
+
+      - name: Verify patch
+        shell: pwsh
+        run: |
+          $path = "tools/server/server-chat.cpp"
+          $content = Get-Content $path -Raw
+
+          if (-not $content.Contains('"output_text"')) {
+              Write-Error "output_text support not found after patch."
+              exit 1
+          }
+
+          Write-Host "Patch verification OK."
+          Select-String -Path $path -Pattern "output_text" -Context 3,3
+
+      - name: Setup CUDA 13.3
+        uses: Jimver/cuda-toolkit@v0.2.30
+        with:
+          cuda: '13.3.0'
+          method: network
+
+      - name: Show CUDA
+        shell: pwsh
+        run: |
+          nvcc --version
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          cmake -B build `
+            -DGGML_CUDA=ON `
+            -DGGML_NATIVE=OFF `
+            -DGGML_CUDA_FA=ON `
+            -DGGML_CUDA_FA_ALL_QUANTS=ON `
+            -DCMAKE_CUDA_ARCHITECTURES=89 `
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --parallel
+
+      - name: Show build output
+        shell: pwsh
+        run: |
+          Get-ChildItem build\bin\Release
+
+      - name: Package binaries
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force package | Out-Null
+
+          Copy-Item build\bin\Release\*.exe package\ -ErrorAction SilentlyContinue
+          Copy-Item build\bin\Release\*.dll package\ -ErrorAction SilentlyContinue
+
+          git rev-parse HEAD |
+              Out-File package\source-commit.txt -Encoding ascii
+
+          git describe --tags --always |
+              Out-File package\source-version.txt -Encoding ascii
+
+          git diff |
+              Out-File package\codex-output-text-fix.patch -Encoding utf8
+
+          @"
+          BeeLlama source: v0.4.6
+          CUDA: 13.3
+          CUDA architecture: sm_89
+          GGML_CUDA_FA: ON
+          GGML_CUDA_FA_ALL_QUANTS: ON
+          GGML_NATIVE: OFF
+
+          Codex Responses compatibility patch:
+          Accept both input_text and output_text in function_call_output.
+          "@ | Out-File package\BUILD-INFO.txt -Encoding utf8
+
+      - name: Create ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path package\* `
+            -DestinationPath beellama-v0.4.6-codex-fix-cuda13.3-sm89.zip `
+            -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: beellama-v0.4.6-codex-fix-cuda13.3-sm89
+          path: beellama-v0.4.6-codex-fix-cuda13.3-sm89.zip
+          if-no-files-found: error
