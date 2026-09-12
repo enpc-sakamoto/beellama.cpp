@@ -82,6 +82,7 @@ jobs:
               Write-Host ""
               Write-Host "Patch target not found."
               Write-Host "Relevant source:"
+
               Select-String `
                   -Path $path `
                   -Pattern "Output of tool call|input_text|output_text" `
@@ -103,7 +104,7 @@ jobs:
 
 
       # ============================================================
-      # Verify patch
+      # Verify Codex patch
       # ============================================================
       - name: Verify Codex patch
         shell: pwsh
@@ -126,17 +127,6 @@ jobs:
 
       # ============================================================
       # CUDA 13.3
-      #
-      # Use llama.cpp/BeeLlama's own Windows CUDA setup action.
-      # This installs all required pieces:
-      #   cudart
-      #   nvcc
-      #   nvrtc
-      #   libcublas
-      #   libnvvm
-      #   VS integration
-      #   CCCL
-      # etc.
       # ============================================================
       - name: Install CUDA Toolkit 13.3
         uses: ./.github/actions/windows-setup-cuda
@@ -160,11 +150,6 @@ jobs:
               exit 1
           }
 
-          Write-Host ""
-          Write-Host "CUDA bin:"
-          Get-ChildItem "$env:CUDA_PATH\bin" |
-              Select-Object -First 20
-
 
       # ============================================================
       # Ninja
@@ -173,53 +158,60 @@ jobs:
         shell: pwsh
         run: |
           choco install ninja -y
-
           ninja --version
 
 
       # ============================================================
-      # Configure + Build
+      # Configure and Build
       #
-      # IMPORTANT:
-      # We explicitly enter the VS2022 MSVC environment BEFORE
-      # calling CMake, preventing windows runner from selecting
-      # C:\mingw64\bin\cc.exe.
+      # RTX 4070 Ti SUPER = Ada = sm_89
       #
-      # RTX 4070 Ti SUPER:
-      #   Ada / sm_89
+      # Only llama-server is built.
+      # Tests are disabled.
+      # ALL_QUANTS is disabled to reduce build time.
       # ============================================================
       - name: Configure and Build BeeLlama
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
 
+          echo ===== Compiler =====
           where cl
-          where nvcc
-          where ninja
-
           cl
 
+          echo ===== CUDA =====
+          where nvcc
+          nvcc --version
+
+          echo ===== Ninja =====
+          where ninja
+          ninja --version
+
+          echo ===== Configure =====
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DGGML_CUDA=ON ^
             -DGGML_NATIVE=OFF ^
             -DGGML_CUDA_FA=ON ^
             -DGGML_CUDA_FA_ALL_QUANTS=OFF ^
+            -DLLAMA_BUILD_TESTS=OFF ^
             -DCMAKE_CUDA_ARCHITECTURES=89
 
           if errorlevel 1 exit /b 1
 
-          cmake --build build --config Release --parallel
+          echo ===== Build llama-server =====
+          cmake --build build --config Release --target llama-server --parallel
 
           if errorlevel 1 exit /b 1
 
 
       # ============================================================
-      # Show build result
+      # Show build output
       # ============================================================
       - name: Show build output
         shell: pwsh
         run: |
-          Write-Host "build/bin:"
+          Write-Host "Build output:"
+
           Get-ChildItem `
               build\bin `
               -Recurse `
@@ -228,11 +220,6 @@ jobs:
 
       # ============================================================
       # Package
-      #
-      # Ninja Multi-Config normally outputs Release under:
-      #   build/bin/Release
-      #
-      # Fall back to build/bin if necessary.
       # ============================================================
       - name: Create package
         shell: pwsh
@@ -255,6 +242,10 @@ jobs:
           Write-Host "Using binary directory:"
           Write-Host $bin
 
+
+          # --------------------------------------------------------
+          # EXE
+          # --------------------------------------------------------
           Get-ChildItem `
               $bin `
               -Filter "*.exe" `
@@ -262,6 +253,10 @@ jobs:
               Copy-Item `
                   -Destination $package
 
+
+          # --------------------------------------------------------
+          # DLL
+          # --------------------------------------------------------
           Get-ChildItem `
               $bin `
               -Filter "*.dll" `
@@ -270,7 +265,9 @@ jobs:
                   -Destination $package
 
 
-          # Source information
+          # --------------------------------------------------------
+          # Source info
+          # --------------------------------------------------------
           git rev-parse HEAD |
               Out-File `
                   "$package\source-commit.txt" `
@@ -282,14 +279,18 @@ jobs:
                   -Encoding ascii
 
 
-          # Save exact patch
+          # --------------------------------------------------------
+          # Save exact Codex patch
+          # --------------------------------------------------------
           git diff |
               Out-File `
                   "$package\codex-output-text-fix.patch" `
                   -Encoding utf8
 
 
+          # --------------------------------------------------------
           # Build information
+          # --------------------------------------------------------
           @"
           BeeLlama Codex compatibility build
 
@@ -312,12 +313,16 @@ jobs:
           sm_89
           RTX 4070 Ti SUPER / Ada
 
-          Build options:
+          Build target:
+          llama-server
+
+          CMake options:
 
           GGML_CUDA=ON
-          GGML_CUDA_FA=ON
-          GGML_CUDA_FA_ALL_QUANTS=ON
           GGML_NATIVE=OFF
+          GGML_CUDA_FA=ON
+          GGML_CUDA_FA_ALL_QUANTS=OFF
+          LLAMA_BUILD_TESTS=OFF
 
           Codex Responses API compatibility patch:
 
@@ -369,6 +374,8 @@ jobs:
 
           Write-Host ""
           Write-Host "Required binaries found."
+          Write-Host "llama-server.exe OK"
+          Write-Host "ggml-cuda.dll OK"
 
 
       # ============================================================
@@ -384,7 +391,7 @@ jobs:
 
 
       # ============================================================
-      # Upload
+      # Upload artifact
       # ============================================================
       - name: Upload artifact
         uses: actions/upload-artifact@v4
