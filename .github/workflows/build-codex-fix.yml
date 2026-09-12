@@ -29,13 +29,8 @@ jobs:
 
 
       # ------------------------------------------------------------
-      # Codex Responses API compatibility fix
-      #
-      # Before:
-      #   input_text only
-      #
-      # After:
-      #   input_text OR output_text
+      # Codex Responses API compatibility patch
+      # Accept output_text in function_call_output
       # ------------------------------------------------------------
       - name: Patch Codex output_text support
         shell: pwsh
@@ -75,6 +70,13 @@ jobs:
           )
 
           if ($patched -eq $content) {
+              Write-Host ""
+              Write-Host "Patch target around Input text:"
+              Select-String `
+                  -Path $path `
+                  -Pattern "Output of tool call|input_text" `
+                  -Context 8,8
+
               Write-Error "Codex patch target was not found."
               exit 1
           }
@@ -110,14 +112,16 @@ jobs:
 
 
       # ------------------------------------------------------------
-      # Install CUDA 13.3 directly from NVIDIA
+      # CUDA 13.3
+      # Install nvcc + runtime only.
+      # Ninja is used, so Visual Studio CUDA integration is not needed.
       # ------------------------------------------------------------
       - name: Download CUDA 13.3 installer
         shell: pwsh
         run: |
           $url = "https://developer.download.nvidia.com/compute/cuda/13.3.0/network_installers/cuda_13.3.0_windows_network.exe"
 
-          Write-Host "Downloading:"
+          Write-Host "Downloading CUDA:"
           Write-Host $url
 
           Invoke-WebRequest `
@@ -151,7 +155,6 @@ jobs:
         shell: pwsh
         run: |
           Write-Host "CUDA_PATH=$env:CUDA_PATH"
-
           nvcc --version
 
           if (-not (Test-Path "$env:CUDA_PATH\bin\nvcc.exe")) {
@@ -161,12 +164,20 @@ jobs:
 
 
       # ------------------------------------------------------------
-      # Configure BeeLlama
+      # Verify Ninja
+      # ------------------------------------------------------------
+      - name: Verify Ninja
+        shell: pwsh
+        run: |
+          ninja --version
+
+
+      # ------------------------------------------------------------
+      # Configure
       #
-      # RTX 4070 Ti SUPER = Ada / sm_89
+      # RTX 4070 Ti SUPER = Ada = sm_89
       #
-      # ALL_QUANTS is intentionally ON because your runtime uses
-      # KVarN cache combinations.
+      # Ninja avoids Visual Studio CUDA toolset integration problems.
       # ------------------------------------------------------------
       - name: Configure CMake
         shell: pwsh
@@ -174,35 +185,45 @@ jobs:
           cmake `
             -S . `
             -B build `
+            -G Ninja `
             -DGGML_CUDA=ON `
             -DGGML_NATIVE=OFF `
             -DGGML_CUDA_FA=ON `
             -DGGML_CUDA_FA_ALL_QUANTS=ON `
             -DCMAKE_CUDA_ARCHITECTURES=89 `
+            -DCMAKE_CUDA_COMPILER="$env:CUDA_PATH\bin\nvcc.exe" `
             -DCMAKE_BUILD_TYPE=Release
 
 
+      # ------------------------------------------------------------
+      # Build
+      # ------------------------------------------------------------
       - name: Build BeeLlama
         shell: pwsh
         run: |
           cmake `
             --build build `
-            --config Release `
             --parallel
 
 
-      - name: Show binaries
+      # ------------------------------------------------------------
+      # Inspect output
+      # ------------------------------------------------------------
+      - name: Show build output
         shell: pwsh
         run: |
-          Write-Host "Build output:"
+          if (-not (Test-Path "build\bin")) {
+              Write-Error "build\bin does not exist."
+              exit 1
+          }
 
           Get-ChildItem `
-              build\bin\Release `
+              build\bin `
               -File
 
 
       # ------------------------------------------------------------
-      # Package
+      # Package binaries
       # ------------------------------------------------------------
       - name: Create package
         shell: pwsh
@@ -216,12 +237,12 @@ jobs:
               Out-Null
 
           Copy-Item `
-              build\bin\Release\*.exe `
+              build\bin\*.exe `
               $package `
               -ErrorAction SilentlyContinue
 
           Copy-Item `
-              build\bin\Release\*.dll `
+              build\bin\*.dll `
               $package `
               -ErrorAction SilentlyContinue
 
@@ -256,7 +277,10 @@ jobs:
 
           CUDA architecture:
           sm_89
-          RTX 40 series / Ada
+          RTX 4070 Ti SUPER / Ada
+
+          Generator:
+          Ninja
 
           CMake:
           GGML_CUDA=ON
@@ -266,14 +290,12 @@ jobs:
 
           Codex Responses API patch:
 
-          function_call_output accepts:
+          function_call_output accepts both:
 
           input_text
           output_text
 
-          Purpose:
-
-          Fixes:
+          Intended fix:
 
           HTTP 400
           Output of tool call should be 'Input text'
@@ -283,6 +305,21 @@ jobs:
                   -Encoding utf8
 
 
+      - name: Verify package
+        shell: pwsh
+        run: |
+          Write-Host "Packaged files:"
+          Get-ChildItem package -File
+
+          if (-not (Get-ChildItem package -Filter "*.exe")) {
+              Write-Error "No executable files were packaged."
+              exit 1
+          }
+
+
+      # ------------------------------------------------------------
+      # ZIP
+      # ------------------------------------------------------------
       - name: Create ZIP
         shell: pwsh
         run: |
@@ -292,6 +329,9 @@ jobs:
               -Force
 
 
+      # ------------------------------------------------------------
+      # Artifact
+      # ------------------------------------------------------------
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
