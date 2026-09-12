@@ -32,17 +32,18 @@ jobs:
 
 
       # ============================================================
-      # Codex Responses API compatibility patch
+      # Codex Responses API compatibility patch + debug logging
       #
-      # Fix:
-      #   HTTP 400
-      #   Output of tool call should be 'Input text'
+      # Original:
+      #   type must be input_text
       #
-      # Accept:
-      #   input_text
-      #   output_text
+      # Modified:
+      #   - log actual tool output JSON
+      #   - accept JSON string
+      #   - accept any object containing string "text"
+      #   - normalize to type = text
       # ============================================================
-      - name: Patch Codex output_text support
+      - name: Patch Codex tool output compatibility
         shell: pwsh
         run: |
           $path = "tools/server/server-chat.cpp"
@@ -54,22 +55,34 @@ jobs:
 
           $content = Get-Content $path -Raw
 
-          Write-Host "Current target:"
+          Write-Host "Original target:"
           Select-String `
               -Path $path `
               -Pattern "Output of tool call|input_text" `
-              -Context 6,6
+              -Context 8,8
 
-          $pattern = 'if\s*\(\s*!chatcmpl_output\.contains\("type"\)\s*\|\|\s*chatcmpl_output\.at\("type"\)\s*!=\s*"input_text"\s*\)\s*\{\s*throw\s+std::invalid_argument\("Output of tool call should be ''Input text''"\);\s*\}'
+
+          $pattern = 'if\s*\(\s*!chatcmpl_output\.contains\("type"\)\s*\|\|\s*chatcmpl_output\.at\("type"\)\s*!=\s*"input_text"\s*\)\s*\{\s*throw\s+std::invalid_argument\("Output of tool call should be ''Input text''"\);\s*\}\s*chatcmpl_output\["type"\]\s*=\s*"text"\s*;'
+
 
           $replacement = @'
-          if (!chatcmpl_output.contains("type") ||
-              (chatcmpl_output.at("type") != "input_text" &&
-               chatcmpl_output.at("type") != "output_text")) {
+          SRV_WRN("Codex function_call_output item: %s\n", chatcmpl_output.dump().c_str());
+
+          if (chatcmpl_output.is_string()) {
+              chatcmpl_output = {
+                  {"type", "text"},
+                  {"text", chatcmpl_output.get<std::string>()}
+              };
+          } else if (chatcmpl_output.is_object() &&
+                     chatcmpl_output.contains("text") &&
+                     chatcmpl_output.at("text").is_string()) {
+              chatcmpl_output["type"] = "text";
+          } else {
               throw std::invalid_argument(
-                  "Output of tool call should be 'input_text' or 'output_text'");
+                  "Output of tool call should contain text");
           }
           '@
+
 
           $patched = [regex]::Replace(
               $content,
@@ -78,19 +91,22 @@ jobs:
               [System.Text.RegularExpressions.RegexOptions]::Singleline
           )
 
+
           if ($patched -eq $content) {
               Write-Host ""
-              Write-Host "Patch target not found."
+              Write-Host "Patch target was not found."
+              Write-Host ""
               Write-Host "Relevant source:"
 
               Select-String `
                   -Path $path `
-                  -Pattern "Output of tool call|input_text|output_text" `
-                  -Context 10,10
+                  -Pattern "Output of tool call|input_text|chatcmpl_output" `
+                  -Context 15,15
 
-              Write-Error "Codex patch was NOT applied. Aborting."
+              Write-Error "Codex compatibility patch was NOT applied."
               exit 1
           }
+
 
           Set-Content `
               -Path $path `
@@ -98,13 +114,14 @@ jobs:
               -NoNewline `
               -Encoding UTF8
 
+
           Write-Host ""
           Write-Host "Patch applied:"
           git diff -- $path
 
 
       # ============================================================
-      # Verify Codex patch
+      # Verify patch
       # ============================================================
       - name: Verify Codex patch
         shell: pwsh
@@ -112,17 +129,27 @@ jobs:
           $path = "tools/server/server-chat.cpp"
           $content = Get-Content $path -Raw
 
-          if (-not $content.Contains('"output_text"')) {
-              Write-Error "output_text support not found."
+          if (-not $content.Contains("Codex function_call_output item")) {
+              Write-Error "Codex debug logging was not found."
               exit 1
           }
 
-          Write-Host "Codex patch verification OK."
+          if (-not $content.Contains("Output of tool call should contain text")) {
+              Write-Error "New Codex compatibility code was not found."
+              exit 1
+          }
+
+          if (-not $content.Contains("chatcmpl_output.is_string()")) {
+              Write-Error "String tool output support was not found."
+              exit 1
+          }
+
+          Write-Host "Codex compatibility patch verification OK."
 
           Select-String `
               -Path $path `
-              -Pattern "output_text" `
-              -Context 5,5
+              -Pattern "Codex function_call_output item|Output of tool call should contain text" `
+              -Context 12,12
 
 
       # ============================================================
@@ -167,8 +194,8 @@ jobs:
       # RTX 4070 Ti SUPER = Ada = sm_89
       #
       # Only llama-server is built.
-      # Tests are disabled.
-      # ALL_QUANTS is disabled to reduce build time.
+      # Tests disabled.
+      # ALL_QUANTS disabled.
       # ============================================================
       - name: Configure and Build BeeLlama
         shell: cmd
@@ -188,6 +215,7 @@ jobs:
           ninja --version
 
           echo ===== Configure =====
+
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DGGML_CUDA=ON ^
             -DGGML_NATIVE=OFF ^
@@ -199,13 +227,14 @@ jobs:
           if errorlevel 1 exit /b 1
 
           echo ===== Build llama-server =====
+
           cmake --build build --config Release --target llama-server --parallel
 
           if errorlevel 1 exit /b 1
 
 
       # ============================================================
-      # Show build output
+      # Show output
       # ============================================================
       - name: Show build output
         shell: pwsh
@@ -232,6 +261,7 @@ jobs:
               -Force |
               Out-Null
 
+
           if (Test-Path "build\bin\Release") {
               $bin = "build\bin\Release"
           }
@@ -239,13 +269,12 @@ jobs:
               $bin = "build\bin"
           }
 
+
           Write-Host "Using binary directory:"
           Write-Host $bin
 
 
-          # --------------------------------------------------------
           # EXE
-          # --------------------------------------------------------
           Get-ChildItem `
               $bin `
               -Filter "*.exe" `
@@ -254,9 +283,7 @@ jobs:
                   -Destination $package
 
 
-          # --------------------------------------------------------
           # DLL
-          # --------------------------------------------------------
           Get-ChildItem `
               $bin `
               -Filter "*.dll" `
@@ -265,32 +292,28 @@ jobs:
                   -Destination $package
 
 
-          # --------------------------------------------------------
-          # Source info
-          # --------------------------------------------------------
+          # Source commit
           git rev-parse HEAD |
               Out-File `
                   "$package\source-commit.txt" `
                   -Encoding ascii
 
+
+          # Source version
           git describe --tags --always |
               Out-File `
                   "$package\source-version.txt" `
                   -Encoding ascii
 
 
-          # --------------------------------------------------------
-          # Save exact Codex patch
-          # --------------------------------------------------------
+          # Exact applied patch
           git diff |
               Out-File `
-                  "$package\codex-output-text-fix.patch" `
+                  "$package\codex-tool-output-fix.patch" `
                   -Encoding utf8
 
 
-          # --------------------------------------------------------
-          # Build information
-          # --------------------------------------------------------
+          # Build info
           @"
           BeeLlama Codex compatibility build
 
@@ -316,7 +339,7 @@ jobs:
           Build target:
           llama-server
 
-          CMake options:
+          Build options:
 
           GGML_CUDA=ON
           GGML_NATIVE=OFF
@@ -326,15 +349,29 @@ jobs:
 
           Codex Responses API compatibility patch:
 
-          function_call_output accepts both:
+          function_call_output content no longer requires
+          a specific input_text/output_text type.
 
-          input_text
-          output_text
+          Accepted:
 
-          Intended fix:
+          - JSON string
+          - JSON object containing a string "text" field
 
-          HTTP 400
+          Both are normalized internally to:
+
+          type = text
+
+          Debug logging added:
+
+          Codex function_call_output item: <raw JSON>
+
+          Intended fixes:
+
+          HTTP 400:
           Output of tool call should be 'Input text'
+
+          HTTP 400:
+          Output of tool call should be 'input_text' or 'output_text'
           "@ |
               Out-File `
                   "$package\BUILD-INFO.txt" `
@@ -350,6 +387,7 @@ jobs:
           Write-Host "Packaged files:"
           Get-ChildItem package -File
 
+
           $server = Get-ChildItem `
               package `
               -Filter "llama-server.exe" `
@@ -360,6 +398,7 @@ jobs:
               Write-Error "llama-server.exe was not packaged."
               exit 1
           }
+
 
           $cuda = Get-ChildItem `
               package `
@@ -372,8 +411,9 @@ jobs:
               exit 1
           }
 
+
           Write-Host ""
-          Write-Host "Required binaries found."
+          Write-Host "Required binaries found:"
           Write-Host "llama-server.exe OK"
           Write-Host "ggml-cuda.dll OK"
 
@@ -386,7 +426,7 @@ jobs:
         run: |
           Compress-Archive `
               -Path package\* `
-              -DestinationPath "beellama-v0.4.6-codex-fix-cuda13.3-sm89.zip" `
+              -DestinationPath "beellama-v0.4.6-codex-tool-output-debug-cuda13.3-sm89.zip" `
               -Force
 
 
@@ -396,6 +436,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: beellama-v0.4.6-codex-fix-cuda13.3-sm89
-          path: beellama-v0.4.6-codex-fix-cuda13.3-sm89.zip
+          name: beellama-v0.4.6-codex-tool-output-debug-cuda13.3-sm89
+          path: beellama-v0.4.6-codex-tool-output-debug-cuda13.3-sm89.zip
           if-no-files-found: error
