@@ -5,9 +5,12 @@ on:
 
 jobs:
   build:
-    runs-on: windows-2025
+    runs-on: windows-2022
 
     steps:
+      # ============================================================
+      # Checkout
+      # ============================================================
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -28,10 +31,17 @@ jobs:
           git rev-parse HEAD
 
 
-      # ------------------------------------------------------------
+      # ============================================================
       # Codex Responses API compatibility patch
-      # Accept output_text in function_call_output
-      # ------------------------------------------------------------
+      #
+      # Fix:
+      #   HTTP 400
+      #   Output of tool call should be 'Input text'
+      #
+      # Accept:
+      #   input_text
+      #   output_text
+      # ============================================================
       - name: Patch Codex output_text support
         shell: pwsh
         run: |
@@ -44,12 +54,11 @@ jobs:
 
           $content = Get-Content $path -Raw
 
-          Write-Host "Searching patch target..."
-
+          Write-Host "Current target:"
           Select-String `
               -Path $path `
               -Pattern "Output of tool call|input_text" `
-              -Context 5,5
+              -Context 6,6
 
           $pattern = 'if\s*\(\s*!chatcmpl_output\.contains\("type"\)\s*\|\|\s*chatcmpl_output\.at\("type"\)\s*!=\s*"input_text"\s*\)\s*\{\s*throw\s+std::invalid_argument\("Output of tool call should be ''Input text''"\);\s*\}'
 
@@ -71,13 +80,14 @@ jobs:
 
           if ($patched -eq $content) {
               Write-Host ""
-              Write-Host "Patch target around Input text:"
+              Write-Host "Patch target not found."
+              Write-Host "Relevant source:"
               Select-String `
                   -Path $path `
-                  -Pattern "Output of tool call|input_text" `
-                  -Context 8,8
+                  -Pattern "Output of tool call|input_text|output_text" `
+                  -Context 10,10
 
-              Write-Error "Codex patch target was not found."
+              Write-Error "Codex patch was NOT applied. Aborting."
               exit 1
           }
 
@@ -92,6 +102,9 @@ jobs:
           git diff -- $path
 
 
+      # ============================================================
+      # Verify patch
+      # ============================================================
       - name: Verify Codex patch
         shell: pwsh
         run: |
@@ -99,7 +112,7 @@ jobs:
           $content = Get-Content $path -Raw
 
           if (-not $content.Contains('"output_text"')) {
-              Write-Error "output_text was not found after patch."
+              Write-Error "output_text support not found."
               exit 1
           }
 
@@ -108,123 +121,119 @@ jobs:
           Select-String `
               -Path $path `
               -Pattern "output_text" `
-              -Context 4,4
+              -Context 5,5
 
 
-      # ------------------------------------------------------------
+      # ============================================================
       # CUDA 13.3
-      # Install nvcc + runtime only.
-      # Ninja is used, so Visual Studio CUDA integration is not needed.
-      # ------------------------------------------------------------
-      - name: Download CUDA 13.3 installer
-        shell: pwsh
-        run: |
-          $url = "https://developer.download.nvidia.com/compute/cuda/13.3.0/network_installers/cuda_13.3.0_windows_network.exe"
-
-          Write-Host "Downloading CUDA:"
-          Write-Host $url
-
-          Invoke-WebRequest `
-              -Uri $url `
-              -OutFile "$env:RUNNER_TEMP\cuda-installer.exe"
-
-
-      - name: Install CUDA 13.3
-        shell: pwsh
-        run: |
-          $installer = "$env:RUNNER_TEMP\cuda-installer.exe"
-
-          Start-Process `
-              -FilePath $installer `
-              -ArgumentList "-s nvcc_13.3 cudart_13.3" `
-              -Wait `
-              -NoNewWindow
-
-          $cuda = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
-
-          if (-not (Test-Path "$cuda\bin\nvcc.exe")) {
-              Write-Error "CUDA installation failed: nvcc.exe not found"
-              exit 1
-          }
-
-          "CUDA_PATH=$cuda" >> $env:GITHUB_ENV
-          "$cuda\bin" >> $env:GITHUB_PATH
+      #
+      # Use llama.cpp/BeeLlama's own Windows CUDA setup action.
+      # This installs all required pieces:
+      #   cudart
+      #   nvcc
+      #   nvrtc
+      #   libcublas
+      #   libnvvm
+      #   VS integration
+      #   CCCL
+      # etc.
+      # ============================================================
+      - name: Install CUDA Toolkit 13.3
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '13.3'
+          cuda_arch: 'x64'
 
 
+      # ============================================================
+      # Verify CUDA
+      # ============================================================
       - name: Verify CUDA
         shell: pwsh
         run: |
           Write-Host "CUDA_PATH=$env:CUDA_PATH"
+
           nvcc --version
 
           if (-not (Test-Path "$env:CUDA_PATH\bin\nvcc.exe")) {
-              Write-Error "nvcc verification failed."
+              Write-Error "nvcc.exe was not found."
               exit 1
           }
 
+          Write-Host ""
+          Write-Host "CUDA bin:"
+          Get-ChildItem "$env:CUDA_PATH\bin" |
+              Select-Object -First 20
 
-      # ------------------------------------------------------------
-      # Verify Ninja
-      # ------------------------------------------------------------
-      - name: Verify Ninja
+
+      # ============================================================
+      # Ninja
+      # ============================================================
+      - name: Install Ninja
         shell: pwsh
         run: |
+          choco install ninja -y
+
           ninja --version
 
 
-      # ------------------------------------------------------------
-      # Configure
+      # ============================================================
+      # Configure + Build
       #
-      # RTX 4070 Ti SUPER = Ada = sm_89
+      # IMPORTANT:
+      # We explicitly enter the VS2022 MSVC environment BEFORE
+      # calling CMake, preventing windows runner from selecting
+      # C:\mingw64\bin\cc.exe.
       #
-      # Ninja avoids Visual Studio CUDA toolset integration problems.
-      # ------------------------------------------------------------
-      - name: Configure CMake
-        shell: pwsh
+      # RTX 4070 Ti SUPER:
+      #   Ada / sm_89
+      # ============================================================
+      - name: Configure and Build BeeLlama
+        shell: cmd
         run: |
-          cmake `
-            -S . `
-            -B build `
-            -G Ninja `
-            -DGGML_CUDA=ON `
-            -DGGML_NATIVE=OFF `
-            -DGGML_CUDA_FA=ON `
-            -DGGML_CUDA_FA_ALL_QUANTS=ON `
-            -DCMAKE_CUDA_ARCHITECTURES=89 `
-            -DCMAKE_CUDA_COMPILER="$env:CUDA_PATH\bin\nvcc.exe" `
-            -DCMAKE_BUILD_TYPE=Release
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+
+          where cl
+          where nvcc
+          where ninja
+
+          cl
+
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_CUDA=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CUDA_FA=ON ^
+            -DGGML_CUDA_FA_ALL_QUANTS=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES=89
+
+          if errorlevel 1 exit /b 1
+
+          cmake --build build --config Release --parallel
+
+          if errorlevel 1 exit /b 1
 
 
-      # ------------------------------------------------------------
-      # Build
-      # ------------------------------------------------------------
-      - name: Build BeeLlama
-        shell: pwsh
-        run: |
-          cmake `
-            --build build `
-            --parallel
-
-
-      # ------------------------------------------------------------
-      # Inspect output
-      # ------------------------------------------------------------
+      # ============================================================
+      # Show build result
+      # ============================================================
       - name: Show build output
         shell: pwsh
         run: |
-          if (-not (Test-Path "build\bin")) {
-              Write-Error "build\bin does not exist."
-              exit 1
-          }
-
+          Write-Host "build/bin:"
           Get-ChildItem `
               build\bin `
+              -Recurse `
               -File
 
 
-      # ------------------------------------------------------------
-      # Package binaries
-      # ------------------------------------------------------------
+      # ============================================================
+      # Package
+      #
+      # Ninja Multi-Config normally outputs Release under:
+      #   build/bin/Release
+      #
+      # Fall back to build/bin if necessary.
+      # ============================================================
       - name: Create package
         shell: pwsh
         run: |
@@ -236,17 +245,32 @@ jobs:
               -Force |
               Out-Null
 
-          Copy-Item `
-              build\bin\*.exe `
-              $package `
-              -ErrorAction SilentlyContinue
+          if (Test-Path "build\bin\Release") {
+              $bin = "build\bin\Release"
+          }
+          else {
+              $bin = "build\bin"
+          }
 
-          Copy-Item `
-              build\bin\*.dll `
-              $package `
-              -ErrorAction SilentlyContinue
+          Write-Host "Using binary directory:"
+          Write-Host $bin
+
+          Get-ChildItem `
+              $bin `
+              -Filter "*.exe" `
+              -File |
+              Copy-Item `
+                  -Destination $package
+
+          Get-ChildItem `
+              $bin `
+              -Filter "*.dll" `
+              -File |
+              Copy-Item `
+                  -Destination $package
 
 
+          # Source information
           git rev-parse HEAD |
               Out-File `
                   "$package\source-commit.txt" `
@@ -257,20 +281,29 @@ jobs:
                   "$package\source-version.txt" `
                   -Encoding ascii
 
+
+          # Save exact patch
           git diff |
               Out-File `
                   "$package\codex-output-text-fix.patch" `
                   -Encoding utf8
 
 
+          # Build information
           @"
           BeeLlama Codex compatibility build
 
           Source:
           BeeLlama v0.4.6
 
-          Platform:
+          OS:
           Windows x64
+
+          Compiler:
+          Microsoft Visual C++ / Visual Studio 2022
+
+          Generator:
+          Ninja Multi-Config
 
           CUDA:
           13.3
@@ -279,16 +312,14 @@ jobs:
           sm_89
           RTX 4070 Ti SUPER / Ada
 
-          Generator:
-          Ninja
+          Build options:
 
-          CMake:
           GGML_CUDA=ON
           GGML_CUDA_FA=ON
           GGML_CUDA_FA_ALL_QUANTS=ON
           GGML_NATIVE=OFF
 
-          Codex Responses API patch:
+          Codex Responses API compatibility patch:
 
           function_call_output accepts both:
 
@@ -305,21 +336,44 @@ jobs:
                   -Encoding utf8
 
 
+      # ============================================================
+      # Verify package
+      # ============================================================
       - name: Verify package
         shell: pwsh
         run: |
           Write-Host "Packaged files:"
           Get-ChildItem package -File
 
-          if (-not (Get-ChildItem package -Filter "*.exe")) {
-              Write-Error "No executable files were packaged."
+          $server = Get-ChildItem `
+              package `
+              -Filter "llama-server.exe" `
+              -File `
+              -ErrorAction SilentlyContinue
+
+          if (-not $server) {
+              Write-Error "llama-server.exe was not packaged."
               exit 1
           }
 
+          $cuda = Get-ChildItem `
+              package `
+              -Filter "ggml-cuda.dll" `
+              -File `
+              -ErrorAction SilentlyContinue
 
-      # ------------------------------------------------------------
+          if (-not $cuda) {
+              Write-Error "ggml-cuda.dll was not packaged."
+              exit 1
+          }
+
+          Write-Host ""
+          Write-Host "Required binaries found."
+
+
+      # ============================================================
       # ZIP
-      # ------------------------------------------------------------
+      # ============================================================
       - name: Create ZIP
         shell: pwsh
         run: |
@@ -329,9 +383,9 @@ jobs:
               -Force
 
 
-      # ------------------------------------------------------------
-      # Artifact
-      # ------------------------------------------------------------
+      # ============================================================
+      # Upload
+      # ============================================================
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
