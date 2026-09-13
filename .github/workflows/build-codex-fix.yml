@@ -32,16 +32,24 @@ jobs:
 
 
       # ============================================================
-      # Codex Responses API compatibility patch + debug logging
+      # Codex Responses API compatibility patch
       #
-      # Original:
-      #   type must be input_text
+      # Handles tool output content blocks:
       #
-      # Modified:
-      #   - log actual tool output JSON
-      #   - accept JSON string
-      #   - accept any object containing string "text"
-      #   - normalize to type = text
+      #   input_text
+      #   output_text
+      #   text
+      #   input_image
+      #   raw string
+      #
+      # input_image is converted to Chat Completions style:
+      #
+      #   {
+      #     "type": "image_url",
+      #     "image_url": {
+      #       "url": "data:image/..."
+      #     }
+      #   }
       # ============================================================
       - name: Patch Codex tool output compatibility
         shell: pwsh
@@ -58,28 +66,75 @@ jobs:
           Write-Host "Original target:"
           Select-String `
               -Path $path `
-              -Pattern "Output of tool call|input_text" `
-              -Context 8,8
+              -Pattern "Output of tool call|input_text|chatcmpl_output" `
+              -Context 10,10
 
+
+          # Original BeeLlama v0.4.6 block:
+          #
+          # if (!chatcmpl_output.contains("type") ||
+          #     chatcmpl_output.at("type") != "input_text") {
+          #     throw std::invalid_argument(
+          #         "Output of tool call should be 'Input text'");
+          # }
+          # chatcmpl_output["type"] = "text";
+          #
+          # Replace that block with Codex-compatible handling.
 
           $pattern = 'if\s*\(\s*!chatcmpl_output\.contains\("type"\)\s*\|\|\s*chatcmpl_output\.at\("type"\)\s*!=\s*"input_text"\s*\)\s*\{\s*throw\s+std::invalid_argument\("Output of tool call should be ''Input text''"\);\s*\}\s*chatcmpl_output\["type"\]\s*=\s*"text"\s*;'
 
 
           $replacement = @'
-          SRV_WRN("Codex function_call_output item: %s\n", chatcmpl_output.dump().c_str());
+          SRV_WRN("Codex function_call_output item: %s\n",
+                  chatcmpl_output.dump().c_str());
 
           if (chatcmpl_output.is_string()) {
               chatcmpl_output = {
                   {"type", "text"},
                   {"text", chatcmpl_output.get<std::string>()}
               };
-          } else if (chatcmpl_output.is_object() &&
-                     chatcmpl_output.contains("text") &&
-                     chatcmpl_output.at("text").is_string()) {
-              chatcmpl_output["type"] = "text";
+          } else if (chatcmpl_output.is_object()) {
+              const std::string type =
+                  json_value(chatcmpl_output, "type", std::string());
+
+              if (type == "input_text" ||
+                  type == "output_text" ||
+                  type == "text") {
+
+                  if (!chatcmpl_output.contains("text") ||
+                      !chatcmpl_output.at("text").is_string()) {
+                      throw std::invalid_argument(
+                          "Tool output text block requires 'text'");
+                  }
+
+                  chatcmpl_output["type"] = "text";
+
+              } else if (type == "input_image") {
+
+                  if (!chatcmpl_output.contains("image_url") ||
+                      !chatcmpl_output.at("image_url").is_string()) {
+                      throw std::invalid_argument(
+                          "Tool output image block requires string 'image_url'");
+                  }
+
+                  const std::string url =
+                      chatcmpl_output.at("image_url").get<std::string>();
+
+                  chatcmpl_output = {
+                      {"type", "image_url"},
+                      {"image_url", {
+                          {"url", url}
+                      }}
+                  };
+
+              } else {
+                  throw std::invalid_argument(
+                      "Unsupported tool output content type: " + type);
+              }
+
           } else {
               throw std::invalid_argument(
-                  "Output of tool call should contain text");
+                  "Unsupported tool output content");
           }
           '@
 
@@ -101,7 +156,7 @@ jobs:
               Select-String `
                   -Path $path `
                   -Pattern "Output of tool call|input_text|chatcmpl_output" `
-                  -Context 15,15
+                  -Context 20,20
 
               Write-Error "Codex compatibility patch was NOT applied."
               exit 1
@@ -130,17 +185,22 @@ jobs:
           $content = Get-Content $path -Raw
 
           if (-not $content.Contains("Codex function_call_output item")) {
-              Write-Error "Codex debug logging was not found."
+              Write-Error "Debug logging was not found."
               exit 1
           }
 
-          if (-not $content.Contains("Output of tool call should contain text")) {
-              Write-Error "New Codex compatibility code was not found."
+          if (-not $content.Contains('type == "input_image"')) {
+              Write-Error "input_image support was not found."
               exit 1
           }
 
-          if (-not $content.Contains("chatcmpl_output.is_string()")) {
-              Write-Error "String tool output support was not found."
+          if (-not $content.Contains('{"type", "image_url"}')) {
+              Write-Error "image_url conversion was not found."
+              exit 1
+          }
+
+          if (-not $content.Contains('type == "output_text"')) {
+              Write-Error "output_text support was not found."
               exit 1
           }
 
@@ -148,8 +208,8 @@ jobs:
 
           Select-String `
               -Path $path `
-              -Pattern "Codex function_call_output item|Output of tool call should contain text" `
-              -Context 12,12
+              -Pattern "Codex function_call_output item|input_image|image_url|output_text" `
+              -Context 8,8
 
 
       # ============================================================
@@ -274,7 +334,6 @@ jobs:
           Write-Host $bin
 
 
-          # EXE
           Get-ChildItem `
               $bin `
               -Filter "*.exe" `
@@ -283,7 +342,6 @@ jobs:
                   -Destination $package
 
 
-          # DLL
           Get-ChildItem `
               $bin `
               -Filter "*.dll" `
@@ -292,28 +350,24 @@ jobs:
                   -Destination $package
 
 
-          # Source commit
           git rev-parse HEAD |
               Out-File `
                   "$package\source-commit.txt" `
                   -Encoding ascii
 
 
-          # Source version
           git describe --tags --always |
               Out-File `
                   "$package\source-version.txt" `
                   -Encoding ascii
 
 
-          # Exact applied patch
           git diff |
               Out-File `
-                  "$package\codex-tool-output-fix.patch" `
+                  "$package\codex-tool-output-image-fix.patch" `
                   -Encoding utf8
 
 
-          # Build info
           @"
           BeeLlama Codex compatibility build
 
@@ -347,21 +401,26 @@ jobs:
           GGML_CUDA_FA_ALL_QUANTS=OFF
           LLAMA_BUILD_TESTS=OFF
 
-          Codex Responses API compatibility patch:
+          Codex Responses API compatibility:
 
-          function_call_output content no longer requires
-          a specific input_text/output_text type.
+          Supported function_call_output content:
 
-          Accepted:
+          - raw string
+          - input_text
+          - output_text
+          - text
+          - input_image
 
-          - JSON string
-          - JSON object containing a string "text" field
-
-          Both are normalized internally to:
+          Text blocks normalize to:
 
           type = text
 
-          Debug logging added:
+          Image blocks normalize to:
+
+          type = image_url
+          image_url.url = original image_url
+
+          Debug logging:
 
           Codex function_call_output item: <raw JSON>
 
@@ -372,6 +431,9 @@ jobs:
 
           HTTP 400:
           Output of tool call should be 'input_text' or 'output_text'
+
+          HTTP 400:
+          Output of tool call should contain text
           "@ |
               Out-File `
                   "$package\BUILD-INFO.txt" `
@@ -426,7 +488,7 @@ jobs:
         run: |
           Compress-Archive `
               -Path package\* `
-              -DestinationPath "beellama-v0.4.6-codex-tool-output-debug-cuda13.3-sm89.zip" `
+              -DestinationPath "beellama-v0.4.6-codex-image-fix-cuda13.3-sm89.zip" `
               -Force
 
 
@@ -436,6 +498,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: beellama-v0.4.6-codex-tool-output-debug-cuda13.3-sm89
-          path: beellama-v0.4.6-codex-tool-output-debug-cuda13.3-sm89.zip
+          name: beellama-v0.4.6-codex-image-fix-cuda13.3-sm89
+          path: beellama-v0.4.6-codex-image-fix-cuda13.3-sm89.zip
           if-no-files-found: error
