@@ -1,4 +1,4 @@
-name: Build BeeLlama v0.4.6 Codex Fix
+name: Build BeeLlama v0.4.6 Codex Fix sm75 sm89 Cached
 
 on:
   workflow_dispatch:
@@ -34,7 +34,7 @@ jobs:
       # ============================================================
       # Codex Responses API compatibility patch
       #
-      # Handles tool output content blocks:
+      # Handles:
       #
       #   input_text
       #   output_text
@@ -42,14 +42,6 @@ jobs:
       #   input_image
       #   raw string
       #
-      # input_image is converted to Chat Completions style:
-      #
-      #   {
-      #     "type": "image_url",
-      #     "image_url": {
-      #       "url": "data:image/..."
-      #     }
-      #   }
       # ============================================================
       - name: Patch Codex tool output compatibility
         shell: pwsh
@@ -64,22 +56,12 @@ jobs:
           $content = Get-Content $path -Raw
 
           Write-Host "Original target:"
+
           Select-String `
               -Path $path `
               -Pattern "Output of tool call|input_text|chatcmpl_output" `
               -Context 10,10
 
-
-          # Original BeeLlama v0.4.6 block:
-          #
-          # if (!chatcmpl_output.contains("type") ||
-          #     chatcmpl_output.at("type") != "input_text") {
-          #     throw std::invalid_argument(
-          #         "Output of tool call should be 'Input text'");
-          # }
-          # chatcmpl_output["type"] = "text";
-          #
-          # Replace that block with Codex-compatible handling.
 
           $pattern = 'if\s*\(\s*!chatcmpl_output\.contains\("type"\)\s*\|\|\s*chatcmpl_output\.at\("type"\)\s*!=\s*"input_text"\s*\)\s*\{\s*throw\s+std::invalid_argument\("Output of tool call should be ''Input text''"\);\s*\}\s*chatcmpl_output\["type"\]\s*=\s*"text"\s*;'
 
@@ -93,7 +75,9 @@ jobs:
                   {"type", "text"},
                   {"text", chatcmpl_output.get<std::string>()}
               };
+
           } else if (chatcmpl_output.is_object()) {
+
               const std::string type =
                   json_value(chatcmpl_output, "type", std::string());
 
@@ -103,6 +87,7 @@ jobs:
 
                   if (!chatcmpl_output.contains("text") ||
                       !chatcmpl_output.at("text").is_string()) {
+
                       throw std::invalid_argument(
                           "Tool output text block requires 'text'");
                   }
@@ -113,6 +98,7 @@ jobs:
 
                   if (!chatcmpl_output.contains("image_url") ||
                       !chatcmpl_output.at("image_url").is_string()) {
+
                       throw std::invalid_argument(
                           "Tool output image block requires string 'image_url'");
                   }
@@ -128,11 +114,13 @@ jobs:
                   };
 
               } else {
+
                   throw std::invalid_argument(
                       "Unsupported tool output content type: " + type);
               }
 
           } else {
+
               throw std::invalid_argument(
                   "Unsupported tool output content");
           }
@@ -148,10 +136,9 @@ jobs:
 
 
           if ($patched -eq $content) {
+
               Write-Host ""
               Write-Host "Patch target was not found."
-              Write-Host ""
-              Write-Host "Relevant source:"
 
               Select-String `
                   -Path $path `
@@ -172,6 +159,7 @@ jobs:
 
           Write-Host ""
           Write-Host "Patch applied:"
+
           git diff -- $path
 
 
@@ -182,34 +170,35 @@ jobs:
         shell: pwsh
         run: |
           $path = "tools/server/server-chat.cpp"
+
           $content = Get-Content $path -Raw
+
 
           if (-not $content.Contains("Codex function_call_output item")) {
               Write-Error "Debug logging was not found."
               exit 1
           }
 
+
           if (-not $content.Contains('type == "input_image"')) {
               Write-Error "input_image support was not found."
               exit 1
           }
+
 
           if (-not $content.Contains('{"type", "image_url"}')) {
               Write-Error "image_url conversion was not found."
               exit 1
           }
 
+
           if (-not $content.Contains('type == "output_text"')) {
               Write-Error "output_text support was not found."
               exit 1
           }
 
-          Write-Host "Codex compatibility patch verification OK."
 
-          Select-String `
-              -Path $path `
-              -Pattern "Codex function_call_output item|input_image|image_url|output_text" `
-              -Context 8,8
+          Write-Host "Codex compatibility patch verification OK."
 
 
       # ============================================================
@@ -249,15 +238,57 @@ jobs:
 
 
       # ============================================================
-      # Configure and Build
+      # Restore build cache
       #
-      # RTX 4070 Ti SUPER = Ada = sm_89
+      # Same:
+      #   BeeLlama v0.4.6
+      #   CUDA 13.3
+      #   sm75 + sm89
+      #   FA ALL QUANTS OFF
       #
-      # Only llama-server is built.
-      # Tests disabled.
-      # ALL_QUANTS disabled.
+      # -> second and later builds can reuse compiled objects.
       # ============================================================
-      - name: Configure and Build BeeLlama
+      - name: Restore build cache
+        id: build-cache
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: beellama-v046-win2022-cuda133-sm75real-sm89real-faoff-server-v1
+
+
+      # ============================================================
+      # Show cache status
+      # ============================================================
+      - name: Show cache status
+        shell: pwsh
+        run: |
+          Write-Host "========================================="
+          Write-Host " Build cache"
+          Write-Host "========================================="
+
+          if ("${{ steps.build-cache.outputs.cache-hit }}" -eq "true") {
+              Write-Host "CACHE HIT"
+              Write-Host "Existing object files will be reused."
+          }
+          else {
+              Write-Host "CACHE MISS"
+              Write-Host "Full build will be required."
+          }
+
+
+      # ============================================================
+      # Configure
+      #
+      # RTX 2080 Ti       = Turing = sm_75
+      # RTX 4070 Ti SUPER = Ada    = sm_89
+      #
+      # "-real" means:
+      # build native SASS for these GPUs only.
+      #
+      # No extra PTX compatibility target.
+      #
+      # ============================================================
+      - name: Configure BeeLlama
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
@@ -282,13 +313,95 @@ jobs:
             -DGGML_CUDA_FA=ON ^
             -DGGML_CUDA_FA_ALL_QUANTS=OFF ^
             -DLLAMA_BUILD_TESTS=OFF ^
-            -DCMAKE_CUDA_ARCHITECTURES=89
+            -DCMAKE_CUDA_ARCHITECTURES="75-real;89-real"
 
           if errorlevel 1 exit /b 1
 
+
+      # ============================================================
+      # Verify CMake configuration
+      # ============================================================
+      - name: Verify CMake configuration
+        shell: pwsh
+        run: |
+          $cache = "build\CMakeCache.txt"
+
+          if (-not (Test-Path $cache)) {
+              Write-Error "CMakeCache.txt was not found."
+              exit 1
+          }
+
+
+          Write-Host ""
+          Write-Host "Relevant CMake options:"
+
+          Select-String `
+              -Path $cache `
+              -Pattern "CMAKE_CUDA_ARCHITECTURES|GGML_CUDA_FA_ALL_QUANTS|GGML_CUDA_FA:|GGML_CUDA:"
+
+
+          $arch = Select-String `
+              -Path $cache `
+              -Pattern "^CMAKE_CUDA_ARCHITECTURES"
+
+
+          if (-not $arch) {
+              Write-Error "CMAKE_CUDA_ARCHITECTURES was not found."
+              exit 1
+          }
+
+
+          Write-Host ""
+          Write-Host "Architecture:"
+          Write-Host $arch.Line
+
+
+          if ($arch.Line -notmatch "75-real;89-real") {
+              Write-Error "Expected CUDA architectures 75-real;89-real."
+              exit 1
+          }
+
+
+          $quant = Select-String `
+              -Path $cache `
+              -Pattern "^GGML_CUDA_FA_ALL_QUANTS"
+
+
+          if ($quant) {
+
+              Write-Host ""
+              Write-Host "ALL_QUANTS:"
+              Write-Host $quant.Line
+
+              if ($quant.Line -notmatch "OFF") {
+                  Write-Error "GGML_CUDA_FA_ALL_QUANTS is not OFF."
+                  exit 1
+              }
+          }
+
+
+          Write-Host ""
+          Write-Host "Configuration OK:"
+          Write-Host "sm75-real + sm89-real"
+          Write-Host "ALL_QUANTS = OFF"
+
+
+      # ============================================================
+      # Build llama-server ONLY
+      #
+      # With a cache hit, Ninja should compile only changed files.
+      # ============================================================
+      - name: Build llama-server only
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+
           echo ===== Build llama-server =====
 
-          cmake --build build --config Release --target llama-server --parallel
+          cmake --build build ^
+            --config Release ^
+            --target llama-server ^
+            --parallel
 
           if errorlevel 1 exit /b 1
 
@@ -309,11 +422,25 @@ jobs:
 
       # ============================================================
       # Package
+      #
+      # EXE:
+      #   llama-server.exe only
+      #
+      # DLL:
+      #   required DLLs
       # ============================================================
       - name: Create package
         shell: pwsh
         run: |
+
           $package = "package"
+
+          Remove-Item `
+              $package `
+              -Recurse `
+              -Force `
+              -ErrorAction SilentlyContinue
+
 
           New-Item `
               -ItemType Directory `
@@ -334,21 +461,41 @@ jobs:
           Write-Host $bin
 
 
-          Get-ChildItem `
-              $bin `
-              -Filter "*.exe" `
-              -File |
-              Copy-Item `
-                  -Destination $package
+          # ----------------------------------------------------------
+          # llama-server.exe ONLY
+          # ----------------------------------------------------------
 
+          $server = Join-Path $bin "llama-server.exe"
+
+
+          if (-not (Test-Path $server)) {
+              Write-Error "llama-server.exe was not found: $server"
+              exit 1
+          }
+
+
+          Copy-Item `
+              $server `
+              -Destination $package `
+              -Force
+
+
+          # ----------------------------------------------------------
+          # Required DLLs
+          # ----------------------------------------------------------
 
           Get-ChildItem `
               $bin `
               -Filter "*.dll" `
               -File |
               Copy-Item `
-                  -Destination $package
+                  -Destination $package `
+                  -Force
 
+
+          # ----------------------------------------------------------
+          # Source information
+          # ----------------------------------------------------------
 
           git rev-parse HEAD |
               Out-File `
@@ -368,6 +515,10 @@ jobs:
                   -Encoding utf8
 
 
+          # ----------------------------------------------------------
+          # Build information
+          # ----------------------------------------------------------
+
           @"
           BeeLlama Codex compatibility build
 
@@ -386,12 +537,20 @@ jobs:
           CUDA:
           13.3
 
+
           CUDA architecture:
-          sm_89
+
+          sm_75-real
+          RTX 2080 Ti / Turing
+
+          sm_89-real
           RTX 4070 Ti SUPER / Ada
 
+
           Build target:
-          llama-server
+
+          llama-server only
+
 
           Build options:
 
@@ -400,6 +559,14 @@ jobs:
           GGML_CUDA_FA=ON
           GGML_CUDA_FA_ALL_QUANTS=OFF
           LLAMA_BUILD_TESTS=OFF
+
+          CMAKE_CUDA_ARCHITECTURES=75-real;89-real
+
+
+          GitHub Actions build cache:
+
+          enabled
+
 
           Codex Responses API compatibility:
 
@@ -411,18 +578,22 @@ jobs:
           - text
           - input_image
 
+
           Text blocks normalize to:
 
           type = text
+
 
           Image blocks normalize to:
 
           type = image_url
           image_url.url = original image_url
 
+
           Debug logging:
 
           Codex function_call_output item: <raw JSON>
+
 
           Intended fixes:
 
@@ -446,8 +617,13 @@ jobs:
       - name: Verify package
         shell: pwsh
         run: |
+
           Write-Host "Packaged files:"
-          Get-ChildItem package -File
+
+          Get-ChildItem `
+              package `
+              -File |
+              Sort-Object Name
 
 
           $server = Get-ChildItem `
@@ -455,6 +631,7 @@ jobs:
               -Filter "llama-server.exe" `
               -File `
               -ErrorAction SilentlyContinue
+
 
           if (-not $server) {
               Write-Error "llama-server.exe was not packaged."
@@ -467,6 +644,7 @@ jobs:
               -Filter "ggml-cuda.dll" `
               -File `
               -ErrorAction SilentlyContinue
+
 
           if (-not $cuda) {
               Write-Error "ggml-cuda.dll was not packaged."
@@ -486,10 +664,29 @@ jobs:
       - name: Create ZIP
         shell: pwsh
         run: |
+
+          $zip = "beellama-v0.4.6-codex-image-fix-cuda13.3-sm75-sm89-faoff-server-cached.zip"
+
+
+          Remove-Item `
+              $zip `
+              -Force `
+              -ErrorAction SilentlyContinue
+
+
           Compress-Archive `
               -Path package\* `
-              -DestinationPath "beellama-v0.4.6-codex-image-fix-cuda13.3-sm89.zip" `
+              -DestinationPath $zip `
               -Force
+
+
+          Write-Host ""
+          Write-Host "ZIP:"
+
+          Get-Item $zip |
+              Select-Object `
+                  Name,
+                  @{N="MiB";E={[math]::Round($_.Length / 1MB, 2)}}
 
 
       # ============================================================
@@ -498,6 +695,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: beellama-v0.4.6-codex-image-fix-cuda13.3-sm89
-          path: beellama-v0.4.6-codex-image-fix-cuda13.3-sm89.zip
+          name: beellama-v0.4.6-codex-image-fix-cuda13.3-sm75-sm89-faoff-server-cached
+          path: beellama-v0.4.6-codex-image-fix-cuda13.3-sm75-sm89-faoff-server-cached.zip
           if-no-files-found: error
