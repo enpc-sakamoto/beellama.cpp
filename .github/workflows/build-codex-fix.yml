@@ -1,4 +1,4 @@
-name: Build BeeLlama v0.4.6 Codex Fix sm75 sm89 Cached
+name: Build BeeLlama v0.4.6 Codex Fix sm75 sm89 SelfHosted
 
 on:
   workflow_dispatch:
@@ -10,25 +10,120 @@ jobs:
     steps:
       # ============================================================
       # Checkout
+      #
+      # IMPORTANT:
+      # clean: false
+      #
+      # self-hosted runner 上の build/ を削除せず、
+      # 次回の Ninja 差分ビルドに再利用する。
       # ============================================================
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           submodules: recursive
+          clean: false
 
+      # ============================================================
+      # Reset source only
+      #
+      # build/ は未追跡ディレクトリなので残す。
+      # 前回適用した Codex patch は tracked file なので
+      # git reset --hard で元に戻す。
+      # ============================================================
       - name: Checkout BeeLlama v0.4.6
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command "& '{0}'"
         run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Runner user:"
+          whoami
+
+          Write-Host ""
+          Write-Host "Workspace:"
+          Write-Host $env:GITHUB_WORKSPACE
+
+          git config --global --add safe.directory "$env:GITHUB_WORKSPACE"
+
           git fetch --tags --force
+
           git checkout v0.4.6
+          git reset --hard v0.4.6
+
+          git submodule sync --recursive
           git submodule update --init --recursive
 
+          Write-Host ""
           Write-Host "Version:"
           git describe --tags --always
 
+          Write-Host ""
           Write-Host "Commit:"
           git rev-parse HEAD
+
+      # ============================================================
+      # Verify local build environment
+      #
+      # self-hosted runner:
+      #
+      # CUDA / Ninja / CMake は毎回インストールしない。
+      # PC にインストール済みのものを使用する。
+      # ============================================================
+      - name: Verify local build tools
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command "& '{0}'"
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "========================================="
+          Write-Host " Git"
+          Write-Host "========================================="
+
+          where.exe git
+          git --version
+
+
+          Write-Host ""
+          Write-Host "========================================="
+          Write-Host " CMake"
+          Write-Host "========================================="
+
+          where.exe cmake
+          cmake --version
+
+
+          Write-Host ""
+          Write-Host "========================================="
+          Write-Host " Ninja"
+          Write-Host "========================================="
+
+          where.exe ninja
+          ninja --version
+
+
+          Write-Host ""
+          Write-Host "========================================="
+          Write-Host " CUDA"
+          Write-Host "========================================="
+
+          where.exe nvcc
+          nvcc --version
+
+
+          if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+              throw "git was not found in PATH."
+          }
+
+          if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+              throw "cmake was not found in PATH."
+          }
+
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+              throw "ninja was not found in PATH."
+          }
+
+          if (-not (Get-Command nvcc -ErrorAction SilentlyContinue)) {
+              throw "nvcc was not found in PATH."
+          }
 
 
       # ============================================================
@@ -41,16 +136,16 @@ jobs:
       #   text
       #   input_image
       #   raw string
-      #
       # ============================================================
       - name: Patch Codex tool output compatibility
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command "& '{0}'"
         run: |
+          $ErrorActionPreference = "Stop"
+
           $path = "tools/server/server-chat.cpp"
 
           if (-not (Test-Path $path)) {
-              Write-Error "File not found: $path"
-              exit 1
+              throw "File not found: $path"
           }
 
           $content = Get-Content $path -Raw
@@ -145,8 +240,7 @@ jobs:
                   -Pattern "Output of tool call|input_text|chatcmpl_output" `
                   -Context 20,20
 
-              Write-Error "Codex compatibility patch was NOT applied."
-              exit 1
+              throw "Codex compatibility patch was NOT applied."
           }
 
 
@@ -169,32 +263,30 @@ jobs:
       - name: Verify Codex patch
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command "& '{0}'"
         run: |
+          $ErrorActionPreference = "Stop"
+
           $path = "tools/server/server-chat.cpp"
 
           $content = Get-Content $path -Raw
 
 
           if (-not $content.Contains("Codex function_call_output item")) {
-              Write-Error "Debug logging was not found."
-              exit 1
+              throw "Debug logging was not found."
           }
 
 
           if (-not $content.Contains('type == "input_image"')) {
-              Write-Error "input_image support was not found."
-              exit 1
+              throw "input_image support was not found."
           }
 
 
           if (-not $content.Contains('{"type", "image_url"}')) {
-              Write-Error "image_url conversion was not found."
-              exit 1
+              throw "image_url conversion was not found."
           }
 
 
           if (-not $content.Contains('type == "output_text"')) {
-              Write-Error "output_text support was not found."
-              exit 1
+              throw "output_text support was not found."
           }
 
 
@@ -202,76 +294,85 @@ jobs:
 
 
       # ============================================================
-      # CUDA 13.3
+      # Visual Studio / CUDA environment check
+      #
+      # CUDA 13.3 must already be installed locally.
       # ============================================================
-      - name: Install CUDA Toolkit 13.3
-        uses: ./.github/actions/windows-setup-cuda
-        with:
-          cuda_version: '13.3'
-          cuda_arch: 'x64'
-
-
-      # ============================================================
-      # Verify CUDA
-      # ============================================================
-      - name: Verify CUDA
-        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command "& '{0}'"
+      - name: Verify Visual Studio and CUDA environment
+        shell: cmd
         run: |
-          Write-Host "CUDA_PATH=$env:CUDA_PATH"
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+
+          echo =========================================
+          echo Compiler
+          echo =========================================
+
+          where cl
+          if errorlevel 1 exit /b 1
+
+          cl
+
+
+          echo.
+          echo =========================================
+          echo CUDA
+          echo =========================================
+
+          where nvcc
+          if errorlevel 1 exit /b 1
 
           nvcc --version
 
-          if (-not (Test-Path "$env:CUDA_PATH\bin\nvcc.exe")) {
-              Write-Error "nvcc.exe was not found."
-              exit 1
-          }
+
+          echo.
+          echo =========================================
+          echo CMake
+          echo =========================================
+
+          where cmake
+          if errorlevel 1 exit /b 1
+
+          cmake --version
 
 
-      # ============================================================
-      # Ninja
-      # ============================================================
-      - name: Install Ninja
-        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command "& '{0}'"
-        run: |
-          choco install ninja -y
+          echo.
+          echo =========================================
+          echo Ninja
+          echo =========================================
+
+          where ninja
+          if errorlevel 1 exit /b 1
+
           ninja --version
 
 
       # ============================================================
-      # Restore build cache
+      # Show existing build cache
       #
-      # Same:
-      #   BeeLlama v0.4.6
-      #   CUDA 13.3
-      #   sm75 + sm89
-      #   FA ALL QUANTS OFF
-      #
-      # -> second and later builds can reuse compiled objects.
+      # self-hosted runner では build/ を直接保持する。
+      # GitHub actions/cache は使用しない。
       # ============================================================
-      - name: Restore build cache
-        id: build-cache
-        uses: actions/cache@v4
-        with:
-          path: build
-          key: beellama-v046-win2022-cuda133-sm75real-sm89real-faoff-server-v1
-
-
-      # ============================================================
-      # Show cache status
-      # ============================================================
-      - name: Show cache status
+      - name: Check persistent build directory
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command "& '{0}'"
         run: |
           Write-Host "========================================="
-          Write-Host " Build cache"
+          Write-Host " Persistent build directory"
           Write-Host "========================================="
 
-          if ("${{ steps.build-cache.outputs.cache-hit }}" -eq "true") {
-              Write-Host "CACHE HIT"
-              Write-Host "Existing object files will be reused."
+          if (Test-Path "build\CMakeCache.txt") {
+
+              Write-Host ""
+              Write-Host "BUILD CACHE FOUND"
+              Write-Host ""
+
+              Get-Item "build\CMakeCache.txt" |
+                  Select-Object FullName, LastWriteTime
+
           }
           else {
-              Write-Host "CACHE MISS"
+
+              Write-Host ""
+              Write-Host "NO BUILD CACHE"
               Write-Host "Full build will be required."
           }
 
@@ -282,28 +383,20 @@ jobs:
       # RTX 2080 Ti       = Turing = sm_75
       # RTX 4070 Ti SUPER = Ada    = sm_89
       #
-      # "-real" means:
-      # build native SASS for these GPUs only.
+      # Native SASS only:
       #
-      # No extra PTX compatibility target.
+      #   75-real
+      #   89-real
+      #
+      # QUANT:
+      #
+      #   GGML_CUDA_FA_ALL_QUANTS=OFF
       #
       # ============================================================
       - name: Configure BeeLlama
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
-
-          echo ===== Compiler =====
-          where cl
-          cl
-
-          echo ===== CUDA =====
-          where nvcc
-          nvcc --version
-
-          echo ===== Ninja =====
-          where ninja
-          ninja --version
 
           echo ===== Configure =====
 
@@ -324,11 +417,12 @@ jobs:
       - name: Verify CMake configuration
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command "& '{0}'"
         run: |
+          $ErrorActionPreference = "Stop"
+
           $cache = "build\CMakeCache.txt"
 
           if (-not (Test-Path $cache)) {
-              Write-Error "CMakeCache.txt was not found."
-              exit 1
+              throw "CMakeCache.txt was not found."
           }
 
 
@@ -346,8 +440,7 @@ jobs:
 
 
           if (-not $arch) {
-              Write-Error "CMAKE_CUDA_ARCHITECTURES was not found."
-              exit 1
+              throw "CMAKE_CUDA_ARCHITECTURES was not found."
           }
 
 
@@ -357,8 +450,7 @@ jobs:
 
 
           if ($arch.Line -notmatch "75-real;89-real") {
-              Write-Error "Expected CUDA architectures 75-real;89-real."
-              exit 1
+              throw "Expected CUDA architectures 75-real;89-real."
           }
 
 
@@ -374,8 +466,7 @@ jobs:
               Write-Host $quant.Line
 
               if ($quant.Line -notmatch "OFF") {
-                  Write-Error "GGML_CUDA_FA_ALL_QUANTS is not OFF."
-                  exit 1
+                  throw "GGML_CUDA_FA_ALL_QUANTS is not OFF."
               }
           }
 
@@ -389,7 +480,12 @@ jobs:
       # ============================================================
       # Build llama-server ONLY
       #
-      # With a cache hit, Ninja should compile only changed files.
+      # i7-11700 / 32GB を想定。
+      #
+      # NVCC を大量並列にすると RAM / paging で
+      # 逆に遅くなる可能性があるため parallel=4。
+      #
+      # build/ が残っていれば Ninja が差分だけビルド。
       # ============================================================
       - name: Build llama-server only
         shell: cmd
@@ -401,7 +497,7 @@ jobs:
           cmake --build build ^
             --config Release ^
             --target llama-server ^
-            --parallel
+            --parallel 4
 
           if errorlevel 1 exit /b 1
 
@@ -427,13 +523,15 @@ jobs:
       #   llama-server.exe only
       #
       # DLL:
-      #   required DLLs
+      #   build output DLLs
       # ============================================================
       - name: Create package
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command "& '{0}'"
         run: |
+          $ErrorActionPreference = "Stop"
 
           $package = "package"
+
 
           Remove-Item `
               $package `
@@ -469,8 +567,7 @@ jobs:
 
 
           if (-not (Test-Path $server)) {
-              Write-Error "llama-server.exe was not found: $server"
-              exit 1
+              throw "llama-server.exe was not found: $server"
           }
 
 
@@ -481,7 +578,7 @@ jobs:
 
 
           # ----------------------------------------------------------
-          # Required DLLs
+          # DLLs
           # ----------------------------------------------------------
 
           Get-ChildItem `
@@ -525,6 +622,9 @@ jobs:
           Source:
           BeeLlama v0.4.6
 
+          Runner:
+          GitHub Actions self-hosted Windows
+
           OS:
           Windows x64
 
@@ -535,10 +635,9 @@ jobs:
           Ninja Multi-Config
 
           CUDA:
-          13.3
+          Local CUDA installation
 
-
-          CUDA architecture:
+          CUDA architectures:
 
           sm_75-real
           RTX 2080 Ti / Turing
@@ -546,11 +645,9 @@ jobs:
           sm_89-real
           RTX 4070 Ti SUPER / Ada
 
-
           Build target:
 
           llama-server only
-
 
           Build options:
 
@@ -562,11 +659,14 @@ jobs:
 
           CMAKE_CUDA_ARCHITECTURES=75-real;89-real
 
+          Build reuse:
 
-          GitHub Actions build cache:
+          Local build directory preserved.
+          Ninja incremental build enabled.
 
-          enabled
+          Build parallelism:
 
+          4
 
           Codex Responses API compatibility:
 
@@ -578,33 +678,18 @@ jobs:
           - text
           - input_image
 
-
           Text blocks normalize to:
 
           type = text
-
 
           Image blocks normalize to:
 
           type = image_url
           image_url.url = original image_url
 
-
           Debug logging:
 
           Codex function_call_output item: <raw JSON>
-
-
-          Intended fixes:
-
-          HTTP 400:
-          Output of tool call should be 'Input text'
-
-          HTTP 400:
-          Output of tool call should be 'input_text' or 'output_text'
-
-          HTTP 400:
-          Output of tool call should contain text
           "@ |
               Out-File `
                   "$package\BUILD-INFO.txt" `
@@ -617,6 +702,7 @@ jobs:
       - name: Verify package
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command "& '{0}'"
         run: |
+          $ErrorActionPreference = "Stop"
 
           Write-Host "Packaged files:"
 
@@ -634,8 +720,7 @@ jobs:
 
 
           if (-not $server) {
-              Write-Error "llama-server.exe was not packaged."
-              exit 1
+              throw "llama-server.exe was not packaged."
           }
 
 
@@ -647,8 +732,7 @@ jobs:
 
 
           if (-not $cuda) {
-              Write-Error "ggml-cuda.dll was not packaged."
-              exit 1
+              throw "ggml-cuda.dll was not packaged."
           }
 
 
@@ -664,8 +748,9 @@ jobs:
       - name: Create ZIP
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command "& '{0}'"
         run: |
+          $ErrorActionPreference = "Stop"
 
-          $zip = "beellama-v0.4.6-codex-image-fix-cuda13.3-sm75-sm89-faoff-server-cached.zip"
+          $zip = "beellama-v0.4.6-codex-image-fix-selfhosted-sm75-sm89-faoff-server.zip"
 
 
           Remove-Item `
@@ -695,6 +780,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: beellama-v0.4.6-codex-image-fix-cuda13.3-sm75-sm89-faoff-server-cached
-          path: beellama-v0.4.6-codex-image-fix-cuda13.3-sm75-sm89-faoff-server-cached.zip
+          name: beellama-v0.4.6-codex-image-fix-selfhosted-sm75-sm89-faoff-server
+          path: beellama-v0.4.6-codex-image-fix-selfhosted-sm75-sm89-faoff-server.zip
           if-no-files-found: error
