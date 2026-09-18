@@ -18,7 +18,7 @@ jobs:
           submodules: recursive
 
       - name: Checkout BeeLlama v0.4.6
-        shell: pwsh
+        shell: powershell
         run: |
           git fetch --tags --force
           git checkout v0.4.6
@@ -44,7 +44,7 @@ jobs:
       #
       # ============================================================
       - name: Patch Codex tool output compatibility
-        shell: pwsh
+        shell: powershell
         run: |
           $path = "tools/server/server-chat.cpp"
 
@@ -167,7 +167,7 @@ jobs:
       # Verify patch
       # ============================================================
       - name: Verify Codex patch
-        shell: pwsh
+        shell: powershell
         run: |
           $path = "tools/server/server-chat.cpp"
 
@@ -215,7 +215,7 @@ jobs:
       # Verify CUDA
       # ============================================================
       - name: Verify CUDA
-        shell: pwsh
+        shell: powershell
         run: |
           Write-Host "CUDA_PATH=$env:CUDA_PATH"
 
@@ -231,7 +231,7 @@ jobs:
       # Ninja
       # ============================================================
       - name: Install Ninja
-        shell: pwsh
+        shell: powershell
         run: |
           choco install ninja -y
           ninja --version
@@ -260,7 +260,7 @@ jobs:
       # Show cache status
       # ============================================================
       - name: Show cache status
-        shell: pwsh
+        shell: powershell
         run: |
           Write-Host "========================================="
           Write-Host " Build cache"
@@ -322,7 +322,7 @@ jobs:
       # Verify CMake configuration
       # ============================================================
       - name: Verify CMake configuration
-        shell: pwsh
+        shell: powershell
         run: |
           $cache = "build\CMakeCache.txt"
 
@@ -410,7 +410,7 @@ jobs:
       # Show output
       # ============================================================
       - name: Show build output
-        shell: pwsh
+        shell: powershell
         run: |
           Write-Host "Build output:"
 
@@ -430,7 +430,7 @@ jobs:
       #   required DLLs
       # ============================================================
       - name: Create package
-        shell: pwsh
+        shell: powershell
         run: |
 
           $package = "package"
@@ -615,7 +615,7 @@ jobs:
       # Verify package
       # ============================================================
       - name: Verify package
-        shell: pwsh
+        shell: powershell
         run: |
 
           Write-Host "Packaged files:"
@@ -662,7 +662,7 @@ jobs:
       # ZIP
       # ============================================================
       - name: Create ZIP
-        shell: pwsh
+        shell: powershell
         run: |
 
           $zip = "beellama-v0.4.6-codex-image-fix-cuda13.3-sm75-sm89-faoff-server-cached.zip"
