@@ -9,59 +9,41 @@ jobs:
 
     steps:
       # ============================================================
-      # Checkout repository
+      # Checkout official BeeLlama v0.4.7 Preview directly
       # ============================================================
-      - name: Checkout repository
+      - name: Checkout BeeLlama v0.4.7 Preview
         uses: actions/checkout@v4
         with:
+          repository: Anbeeld/beellama.cpp
+          ref: preview-v0.4.7
           fetch-depth: 0
           submodules: recursive
 
       # ============================================================
-      # Checkout BeeLlama v0.4.7 Preview
-      #
-      # preview-v0.4.7
-      # expected commit:
-      # 0d055e157fd3...
-      #
-      # Fix the exact commit so that a moving preview tag cannot
-      # silently produce a different binary.
+      # Verify source
       # ============================================================
-      - name: Checkout BeeLlama v0.4.7 Preview
+      - name: Verify BeeLlama source
         shell: pwsh
         run: |
-          $expectedCommit = "0d055e157fd3"
-
           Write-Host "========================================="
-          Write-Host " Fetch BeeLlama v0.4.7 Preview"
+          Write-Host " BeeLlama source"
           Write-Host "========================================="
 
-          git fetch --all --tags --force
-
-          # Show the preview tag for diagnostics.
-          Write-Host ""
-          Write-Host "preview-v0.4.7 tag:"
-          git rev-parse preview-v0.4.7
-
-          # Build the exact known v0.4.7 Preview commit.
-          git checkout --force $expectedCommit
-
-          git submodule sync --recursive
-          git submodule update --init --recursive
+          git remote -v
 
           Write-Host ""
-          Write-Host "===== Source version ====="
+          Write-Host "Version:"
           git describe --tags --always
 
           Write-Host ""
-          Write-Host "===== Source commit ====="
-          $actualCommit = (git rev-parse HEAD).Trim()
-          Write-Host $actualCommit
+          Write-Host "Commit:"
+          $commit = (git rev-parse HEAD).Trim()
+          Write-Host $commit
 
-          if (-not $actualCommit.StartsWith($expectedCommit)) {
-              Write-Error "Wrong BeeLlama source commit."
-              Write-Error "Expected: $expectedCommit"
-              Write-Error "Actual:   $actualCommit"
+          if (-not $commit.StartsWith("0d055e1")) {
+              Write-Error "Wrong BeeLlama commit."
+              Write-Error "Expected: 0d055e1..."
+              Write-Error "Actual:   $commit"
               exit 1
           }
 
@@ -69,16 +51,13 @@ jobs:
           Write-Host "BeeLlama v0.4.7 Preview source verification OK."
 
       # ============================================================
-      # Verify source contains v0.4.7 draft batch options
-      #
-      # Before spending time compiling, make sure the selected source
-      # really contains the new independent draft sizing options.
+      # Verify v0.4.7 draft batch features exist in source
       # ============================================================
       - name: Verify v0.4.7 source features
         shell: pwsh
         run: |
           Write-Host "========================================="
-          Write-Host " Verify v0.4.7 draft sizing source"
+          Write-Host " Verify draft batch options in source"
           Write-Host "========================================="
 
           $matches = Get-ChildItem `
@@ -88,7 +67,7 @@ jobs:
               -Include *.cpp,*.h,*.hpp `
               -ErrorAction SilentlyContinue |
               Select-String `
-                  -Pattern "spec-draft-ubatch-size|spec_draft_ubatch|spec-draft-batch-size" `
+                  -Pattern "spec-draft-ubatch-size|spec-draft-batch-size|spec_draft_ubatch|spec_draft_batch" `
                   -ErrorAction SilentlyContinue
 
           if (-not $matches) {
@@ -109,15 +88,11 @@ jobs:
       # Codex Responses API compatibility patch
       #
       # Handles:
-      #
       #   raw string
       #   input_text
       #   output_text
       #   text
       #   input_image
-      #
-      # If v0.4.7 changed the target code, STOP instead of applying
-      # a patch to an uncertain location.
       # ============================================================
       - name: Patch Codex tool output compatibility
         shell: pwsh
@@ -256,7 +231,7 @@ jobs:
           Write-Host "Codex compatibility patch verification OK."
 
       # ============================================================
-      # CUDA 13.3
+      # Install CUDA 13.3
       # ============================================================
       - name: Install CUDA Toolkit 13.3
         uses: ./.github/actions/windows-setup-cuda
@@ -281,7 +256,7 @@ jobs:
           }
 
       # ============================================================
-      # Ninja
+      # Install Ninja
       # ============================================================
       - name: Install Ninja
         shell: pwsh
@@ -292,16 +267,14 @@ jobs:
       # ============================================================
       # Restore build cache
       #
-      # IMPORTANT:
-      # New cache namespace for exact preview-v0.4.7 commit.
-      # Never reuse v0.4.6 objects.
+      # Separate cache key from v0.4.6.
       # ============================================================
       - name: Restore build cache
         id: build-cache
         uses: actions/cache@v4
         with:
           path: build
-          key: beellama-v047-preview-0d055e1-win2022-cuda133-sm75real-sm89real-faoff-server-v1
+          key: beellama-preview-v047-0d055e1-win2022-cuda133-sm75-sm89-faoff-v1
 
       # ============================================================
       # Show cache status
@@ -315,22 +288,16 @@ jobs:
 
           if ("${{ steps.build-cache.outputs.cache-hit }}" -eq "true") {
               Write-Host "CACHE HIT"
-              Write-Host "Existing v0.4.7 Preview objects may be reused."
           }
           else {
               Write-Host "CACHE MISS"
-              Write-Host "A clean v0.4.7 Preview build will be performed."
           }
 
       # ============================================================
       # Configure
       #
-      # RTX 2080 Ti       = Turing = sm_75
-      # RTX 4070 Ti SUPER = Ada    = sm_89
-      #
-      # "-real":
-      # native SASS only for these architectures.
-      #
+      # RTX 2080 Ti       = sm75
+      # RTX 4070 Ti SUPER = sm89
       # ============================================================
       - name: Configure BeeLlama
         shell: cmd
@@ -390,10 +357,6 @@ jobs:
               exit 1
           }
 
-          Write-Host ""
-          Write-Host "Architecture:"
-          Write-Host $arch.Line
-
           if ($arch.Line -notmatch "75-real;89-real") {
               Write-Error "Expected CUDA architectures 75-real;89-real."
               exit 1
@@ -403,32 +366,21 @@ jobs:
               -Path $cache `
               -Pattern "^GGML_CUDA_FA_ALL_QUANTS"
 
-          if ($quant) {
-              Write-Host ""
-              Write-Host "ALL_QUANTS:"
-              Write-Host $quant.Line
-
-              if ($quant.Line -notmatch "OFF") {
-                  Write-Error "GGML_CUDA_FA_ALL_QUANTS is not OFF."
-                  exit 1
-              }
+          if ($quant -and $quant.Line -notmatch "OFF") {
+              Write-Error "GGML_CUDA_FA_ALL_QUANTS is not OFF."
+              exit 1
           }
 
           Write-Host ""
-          Write-Host "Configuration OK:"
-          Write-Host "sm75-real + sm89-real"
-          Write-Host "Flash Attention = ON"
-          Write-Host "FA ALL QUANTS = OFF"
+          Write-Host "CMake configuration OK."
 
       # ============================================================
-      # Build llama-server ONLY
+      # Build llama-server only
       # ============================================================
-      - name: Build llama-server only
+      - name: Build llama-server
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
-
-          echo ===== Build llama-server =====
 
           cmake --build build ^
             --config Release ^
@@ -438,29 +390,20 @@ jobs:
           if errorlevel 1 exit /b 1
 
       # ============================================================
-      # Locate built server
+      # Locate binary
       # ============================================================
       - name: Show build output
         shell: pwsh
         run: |
-          Write-Host "Build output:"
-
           Get-ChildItem `
               build\bin `
               -Recurse `
               -File
 
       # ============================================================
-      # CRITICAL verification
-      #
-      # Check BOTH:
-      #
-      # 1. binary was built from 0d055e1
-      # 2. -bd / -ubd really exist
-      #
-      # Artifact creation stops if either check fails.
+      # Verify binary version and -bd / -ubd
       # ============================================================
-      - name: Verify v0.4.7 Preview binary and ubd support
+      - name: Verify v0.4.7 Preview binary
         shell: pwsh
         run: |
           if (Test-Path "build\bin\Release\llama-server.exe") {
@@ -475,12 +418,6 @@ jobs:
           }
 
           Write-Host "========================================="
-          Write-Host " Binary"
-          Write-Host "========================================="
-          Write-Host $server
-
-          Write-Host ""
-          Write-Host "========================================="
           Write-Host " Version"
           Write-Host "========================================="
 
@@ -489,20 +426,19 @@ jobs:
 
           if ($versionOutput -notmatch "0d055e1") {
               Write-Error "Wrong BeeLlama binary commit."
-              Write-Error "Expected binary commit containing: 0d055e1"
               exit 1
           }
 
           Write-Host ""
           Write-Host "========================================="
-          Write-Host " Draft sizing options"
+          Write-Host " Draft batch options"
           Write-Host "========================================="
 
           $helpOutput = (& $server --help 2>&1 | Out-String)
 
           $helpOutput -split "`r?`n" |
               Select-String `
-                  -Pattern "spec-draft-batch-size|spec-draft-ubatch-size|-bd|-ubd"
+                  -Pattern "spec-draft-batch-size|spec-draft-ubatch-size"
 
           if ($helpOutput -notmatch "spec-draft-batch-size") {
               Write-Error "--spec-draft-batch-size was NOT found."
@@ -515,15 +451,10 @@ jobs:
           }
 
           Write-Host ""
-          Write-Host "========================================="
-          Write-Host " v0.4.7 Preview verification PASSED"
-          Write-Host "========================================="
-          Write-Host "Commit : 0d055e1"
-          Write-Host "-bd    : supported"
-          Write-Host "-ubd   : supported"
+          Write-Host "v0.4.7 Preview binary verification PASSED."
 
       # ============================================================
-      # Create package
+      # Package
       # ============================================================
       - name: Create package
         shell: pwsh
@@ -553,12 +484,6 @@ jobs:
               exit 1
           }
 
-          Write-Host "Using binary directory:"
-          Write-Host $bin
-
-          # ----------------------------------------------------------
-          # llama-server.exe
-          # ----------------------------------------------------------
           $server = Join-Path $bin "llama-server.exe"
 
           Copy-Item `
@@ -566,9 +491,6 @@ jobs:
               -Destination $package `
               -Force
 
-          # ----------------------------------------------------------
-          # Runtime DLLs
-          # ----------------------------------------------------------
           Get-ChildItem `
               $bin `
               -Filter "*.dll" `
@@ -577,9 +499,6 @@ jobs:
                   -Destination $package `
                   -Force
 
-          # ----------------------------------------------------------
-          # Source information
-          # ----------------------------------------------------------
           git rev-parse HEAD |
               Out-File `
                   "$package\source-commit.txt" `
@@ -595,9 +514,6 @@ jobs:
                   "$package\codex-tool-output-image-fix.patch" `
                   -Encoding utf8
 
-          # ----------------------------------------------------------
-          # CLI verification results
-          # ----------------------------------------------------------
           & $server --version 2>&1 |
               Out-File `
                   "$package\llama-server-version.txt" `
@@ -605,109 +521,67 @@ jobs:
 
           & $server --help 2>&1 |
               Select-String `
-                  -Pattern "spec-draft-batch-size|spec-draft-ubatch-size|-bd|-ubd" |
+                  -Pattern "spec-draft-batch-size|spec-draft-ubatch-size" |
               Out-File `
                   "$package\draft-batch-options.txt" `
                   -Encoding utf8
 
-          # ----------------------------------------------------------
-          # Build information
-          # ----------------------------------------------------------
           @"
-          BeeLlama v0.4.7 Preview Codex compatibility build
+          BeeLlama v0.4.7 Preview custom build
 
-          Source:
-          BeeLlama v0.4.7 Preview
+          Source repository:
+          https://github.com/Anbeeld/beellama.cpp
 
-          Release tag:
+          Source tag:
           preview-v0.4.7
 
-          Fixed source commit:
-          0d055e157fd3
+          Expected source commit:
+          0d055e1
 
-          OS:
+          Platform:
           Windows x64
 
           Compiler:
-          Microsoft Visual C++ / Visual Studio 2022
-
-          Generator:
-          Ninja Multi-Config
+          MSVC / Visual Studio 2022
 
           CUDA:
           13.3
 
           CUDA architectures:
-          sm_75-real
-          RTX 2080 Ti / Turing
+          sm75-real
+          sm89-real
 
-          sm_89-real
-          RTX 4070 Ti SUPER / Ada
+          Target GPUs:
+          RTX 2080 Ti
+          RTX 4070 Ti SUPER
 
-          Build target:
-          llama-server only
-
-          Build options:
+          Build:
           GGML_CUDA=ON
           GGML_NATIVE=OFF
           GGML_CUDA_FA=ON
           GGML_CUDA_FA_ALL_QUANTS=OFF
           LLAMA_BUILD_TESTS=OFF
-          CMAKE_CUDA_ARCHITECTURES=75-real;89-real
 
-          BeeLlama v0.4.7 Preview features verified:
+          Built target:
+          llama-server
+
+          BeeLlama v0.4.7 Preview draft options verified:
           --spec-draft-batch-size
-          -bd
-
           --spec-draft-ubatch-size
-          -ubd
 
-          v0.4.7 Preview defaults:
-          draft batch size:
-          512
-
-          draft ubatch size:
-          128
-
-          GitHub Actions build cache:
-          enabled
-
-          Codex Responses API compatibility:
-          Supported function_call_output content:
-          - raw string
-          - input_text
-          - output_text
-          - text
-          - input_image
-
-          Text blocks normalize to:
-          type = text
-
-          Image blocks normalize to:
-          type = image_url
-          image_url.url = original image_url
-
-          Debug logging:
-          Codex function_call_output item: <raw JSON>
-
-          Intended Codex fixes:
-          HTTP 400:
-          Output of tool call should be 'Input text'
-
-          HTTP 400:
-          Output of tool call should be 'input_text' or 'output_text'
-
-          HTTP 400:
-          Output of tool call should contain text
+          Codex Responses API compatibility patch:
+          raw string
+          input_text
+          output_text
+          text
+          input_image
           "@ |
               Out-File `
                   "$package\BUILD-INFO.txt" `
                   -Encoding utf8
 
       # ============================================================
-      # Verify packaged binary
-      #
-      # Run checks AGAIN against the actual EXE that will be zipped.
+      # Verify packaged EXE
       # ============================================================
       - name: Verify packaged binary
         shell: pwsh
@@ -719,47 +593,32 @@ jobs:
               exit 1
           }
 
-          $cuda = Get-ChildItem `
-              package `
-              -Filter "ggml-cuda.dll" `
-              -File `
-              -ErrorAction SilentlyContinue
-
-          if (-not $cuda) {
+          if (-not (Test-Path "package\ggml-cuda.dll")) {
               Write-Error "ggml-cuda.dll was not packaged."
               exit 1
           }
 
           Write-Host "========================================="
-          Write-Host " Packaged server version"
+          Write-Host " Packaged version"
           Write-Host "========================================="
 
           $versionOutput = (& $server --version 2>&1 | Out-String)
           Write-Host $versionOutput
 
           if ($versionOutput -notmatch "0d055e1") {
-              Write-Error "Packaged EXE is not from expected v0.4.7 Preview commit."
+              Write-Error "Packaged EXE is not expected v0.4.7 Preview."
               exit 1
           }
 
-          Write-Host ""
-          Write-Host "========================================="
-          Write-Host " Packaged server draft options"
-          Write-Host "========================================="
-
           $helpOutput = (& $server --help 2>&1 | Out-String)
 
-          $helpOutput -split "`r?`n" |
-              Select-String `
-                  -Pattern "spec-draft-batch-size|spec-draft-ubatch-size|-bd|-ubd"
-
           if ($helpOutput -notmatch "spec-draft-batch-size") {
-              Write-Error "Packaged EXE has no -bd support."
+              Write-Error "Packaged EXE has no draft batch option."
               exit 1
           }
 
           if ($helpOutput -notmatch "spec-draft-ubatch-size") {
-              Write-Error "Packaged EXE has no -ubd support."
+              Write-Error "Packaged EXE has no draft ubatch option."
               exit 1
           }
 
@@ -772,9 +631,7 @@ jobs:
               Sort-Object Name
 
           Write-Host ""
-          Write-Host "========================================="
-          Write-Host " PACKAGE VERIFICATION PASSED"
-          Write-Host "========================================="
+          Write-Host "PACKAGE VERIFICATION PASSED."
 
       # ============================================================
       # ZIP
@@ -782,7 +639,7 @@ jobs:
       - name: Create ZIP
         shell: pwsh
         run: |
-          $zip = "beellama-preview-v0.4.7-0d055e1-codex-cuda13.3-sm75-sm89-faoff-server.zip"
+          $zip = "beellama-preview-v0.4.7-0d055e1-codex-cuda13.3-sm75-sm89.zip"
 
           Remove-Item `
               $zip `
@@ -793,11 +650,6 @@ jobs:
               -Path package\* `
               -DestinationPath $zip `
               -Force
-
-          Write-Host ""
-          Write-Host "========================================="
-          Write-Host " ZIP"
-          Write-Host "========================================="
 
           Get-Item $zip |
               Select-Object `
@@ -810,6 +662,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: beellama-preview-v0.4.7-0d055e1-codex-cuda13.3-sm75-sm89-faoff-server
-          path: beellama-preview-v0.4.7-0d055e1-codex-cuda13.3-sm75-sm89-faoff-server.zip
+          name: beellama-preview-v0.4.7-0d055e1-codex-cuda13.3-sm75-sm89
+          path: beellama-preview-v0.4.7-0d055e1-codex-cuda13.3-sm75-sm89.zip
           if-no-files-found: error
