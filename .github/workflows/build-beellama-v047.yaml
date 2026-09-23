@@ -22,8 +22,8 @@ jobs:
       # ============================================================
       # Verify source tag / commit
       #
-      # preview-v0.4.7 is a rolling preview.
-      # Do NOT pin or validate a fixed commit.
+      # preview-v0.4.7 is rolling preview.
+      # Do not pin a fixed commit.
       # ============================================================
       - name: Verify BeeLlama source
         shell: pwsh
@@ -55,70 +55,7 @@ jobs:
           Write-Host "BeeLlama v0.4.7 Preview source verification OK."
 
       # ============================================================
-      # Verify -bd / -ubd implementation exists in source
-      # ============================================================
-      - name: Verify v0.4.7 draft batch features in source
-        shell: pwsh
-        run: |
-          Write-Host "========================================="
-          Write-Host " Verify draft batch options in source"
-          Write-Host "========================================="
-
-          $files = Get-ChildItem `
-              -Path common,tools `
-              -Recurse `
-              -File `
-              -Include *.cpp,*.c,*.h,*.hpp `
-              -ErrorAction SilentlyContinue
-
-          $bd = $files |
-              Select-String `
-                  -Pattern "spec-draft-batch-size" `
-                  -ErrorAction SilentlyContinue
-
-          $ubd = $files |
-              Select-String `
-                  -Pattern "spec-draft-ubatch-size" `
-                  -ErrorAction SilentlyContinue
-
-          if (-not $bd) {
-              Write-Error "--spec-draft-batch-size was not found in source."
-              exit 1
-          }
-
-          if (-not $ubd) {
-              Write-Error "--spec-draft-ubatch-size was not found in source."
-              exit 1
-          }
-
-          Write-Host ""
-          Write-Host "--- spec-draft-batch-size ---"
-          $bd |
-              Select-Object -First 10 |
-              ForEach-Object {
-                  Write-Host "$($_.Path):$($_.LineNumber): $($_.Line.Trim())"
-              }
-
-          Write-Host ""
-          Write-Host "--- spec-draft-ubatch-size ---"
-          $ubd |
-              Select-Object -First 10 |
-              ForEach-Object {
-                  Write-Host "$($_.Path):$($_.LineNumber): $($_.Line.Trim())"
-              }
-
-          Write-Host ""
-          Write-Host "Draft batch source verification OK."
-
-      # ============================================================
       # Codex Responses API compatibility patch
-      #
-      # Handles:
-      #   raw string
-      #   input_text
-      #   output_text
-      #   text
-      #   input_image
       # ============================================================
       - name: Patch Codex tool output compatibility
         shell: pwsh
@@ -266,7 +203,7 @@ jobs:
           cuda_arch: 'x64'
 
       # ============================================================
-      # Verify CUDA 12.4
+      # Verify CUDA
       # ============================================================
       - name: Verify CUDA
         shell: pwsh
@@ -306,7 +243,7 @@ jobs:
           ninja --version
 
       # ============================================================
-      # Get rolling-preview commit for cache key
+      # Get source commit
       # ============================================================
       - name: Get source commit
         id: source
@@ -323,15 +260,13 @@ jobs:
 
       # ============================================================
       # Restore build cache
-      #
-      # Commit is included because preview-v0.4.7 is rolling.
       # ============================================================
       - name: Restore build cache
         id: build-cache
         uses: actions/cache@v4
         with:
           path: build
-          key: beellama-preview-v047-${{ steps.source.outputs.commit }}-win2022-cuda124-sm75-sm89-faoff-v1
+          key: beellama-preview-v047-${{ steps.source.outputs.commit }}-win2022-cuda124-sm75-sm89-faoff-v2
 
       # ============================================================
       # Show cache status
@@ -352,9 +287,6 @@ jobs:
 
       # ============================================================
       # Configure
-      #
-      # RTX 2080 Ti       = Turing = sm75
-      # RTX 4070 Ti SUPER = Ada    = sm89
       # ============================================================
       - name: Configure BeeLlama
         shell: cmd
@@ -432,7 +364,7 @@ jobs:
           Write-Host "CMake configuration OK."
 
       # ============================================================
-      # Build llama-server only
+      # Build llama-server
       # ============================================================
       - name: Build llama-server
         shell: cmd
@@ -458,7 +390,9 @@ jobs:
               -File
 
       # ============================================================
-      # Verify actual built binary
+      # Verify built binary
+      #
+      # This is the authoritative -bd / -ubd check.
       # ============================================================
       - name: Verify v0.4.7 Preview binary
         shell: pwsh
@@ -496,7 +430,7 @@ jobs:
 
           $helpOutput -split "`r?`n" |
               Select-String `
-                  -Pattern "spec-draft-batch-size|spec-draft-ubatch-size"
+                  -Pattern "spec-draft-batch-size|spec-draft-ubatch-size|-bd|-ubd"
 
           if ($helpOutput -notmatch "spec-draft-batch-size") {
               Write-Error "--spec-draft-batch-size / -bd was NOT found."
@@ -551,17 +485,11 @@ jobs:
           Write-Host "Using binary directory:"
           Write-Host $bin
 
-          # ----------------------------------------------------------
-          # llama-server.exe
-          # ----------------------------------------------------------
           Copy-Item `
               $server `
               -Destination $package `
               -Force
 
-          # ----------------------------------------------------------
-          # Runtime DLLs
-          # ----------------------------------------------------------
           Get-ChildItem `
               $bin `
               -Filter "*.dll" `
@@ -570,9 +498,6 @@ jobs:
                   -Destination $package `
                   -Force
 
-          # ----------------------------------------------------------
-          # Source metadata
-          # ----------------------------------------------------------
           git rev-parse HEAD |
               Out-File `
                   "$package\source-commit.txt" `
@@ -583,43 +508,28 @@ jobs:
                   "$package\source-version.txt" `
                   -Encoding ascii
 
-          # ----------------------------------------------------------
-          # Codex patch
-          # ----------------------------------------------------------
           git diff |
               Out-File `
                   "$package\codex-tool-output-image-fix.patch" `
                   -Encoding utf8
 
-          # ----------------------------------------------------------
-          # Binary version
-          # ----------------------------------------------------------
           & $server --version 2>&1 |
               Out-File `
                   "$package\llama-server-version.txt" `
                   -Encoding utf8
 
-          # ----------------------------------------------------------
-          # Draft options
-          # ----------------------------------------------------------
           & $server --help 2>&1 |
               Select-String `
-                  -Pattern "spec-draft-batch-size|spec-draft-ubatch-size" |
+                  -Pattern "spec-draft-batch-size|spec-draft-ubatch-size|-bd|-ubd" |
               Out-File `
                   "$package\draft-batch-options.txt" `
                   -Encoding utf8
 
-          # ----------------------------------------------------------
-          # CUDA version
-          # ----------------------------------------------------------
           nvcc --version |
               Out-File `
                   "$package\cuda-version.txt" `
                   -Encoding utf8
 
-          # ----------------------------------------------------------
-          # Build info
-          # ----------------------------------------------------------
           $sourceCommit = (git rev-parse HEAD).Trim()
           $sourceVersion = (git describe --tags --always).Trim()
 
@@ -640,7 +550,7 @@ jobs:
 
           NOTE:
           preview-v0.4.7 is a rolling preview.
-          The commit may change between builds.
+          Commit may change between builds.
 
           Platform:
           Windows x64
@@ -670,12 +580,9 @@ jobs:
           Built target:
           llama-server
 
-          BeeLlama v0.4.7 Preview draft options verified:
-          --spec-draft-batch-size
-          -bd
-
-          --spec-draft-ubatch-size
-          -ubd
+          Required draft options:
+          --spec-draft-batch-size / -bd
+          --spec-draft-ubatch-size / -ubd
 
           Codex Responses API compatibility patch:
           - raw string
@@ -689,7 +596,7 @@ jobs:
                   -Encoding utf8
 
       # ============================================================
-      # Verify packaged binary again
+      # Verify packaged binary
       # ============================================================
       - name: Verify packaged binary
         shell: pwsh
@@ -721,7 +628,7 @@ jobs:
 
           $helpOutput -split "`r?`n" |
               Select-String `
-                  -Pattern "spec-draft-batch-size|spec-draft-ubatch-size"
+                  -Pattern "spec-draft-batch-size|spec-draft-ubatch-size|-bd|-ubd"
 
           if ($helpOutput -notmatch "spec-draft-batch-size") {
               Write-Error "Packaged EXE has no -bd support."
