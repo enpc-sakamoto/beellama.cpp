@@ -1,4 +1,4 @@
-name: Build BeeLlama v0.4.7 Preview Codex Fix sm75 sm89 CUDA 12.4
+name: Build BeeLlama v0.4.7 Preview ubd Codex Fix CUDA 12.4 sm75 sm89
 
 on:
   workflow_dispatch:
@@ -8,56 +8,59 @@ jobs:
     runs-on: windows-2022
 
     steps:
+
       # ============================================================
-      # Checkout official BeeLlama v0.4.7 Preview
+      # Checkout BeeLlama
+      #
+      # Pin commit containing:
+      #   --spec-draft-ubatch-size
+      #   -ubd
+      #
       # ============================================================
-      - name: Checkout BeeLlama v0.4.7 Preview
+
+      - name: Checkout BeeLlama pinned commit
         uses: actions/checkout@v4
         with:
           repository: Anbeeld/beellama.cpp
-          ref: preview-v0.4.7
+          ref: 1156b183630eb8bd76ff931348d0b1a258ae171b
           fetch-depth: 0
           submodules: recursive
 
+
       # ============================================================
-      # Verify source tag / commit
-      #
-      # preview-v0.4.7 is rolling preview.
-      # Do not pin a fixed commit.
+      # Verify source commit
       # ============================================================
-      - name: Verify BeeLlama source
+
+      - name: Verify pinned BeeLlama commit
+        id: source
         shell: pwsh
         run: |
+          $expected = "1156b183630eb8bd76ff931348d0b1a258ae171b"
+          $actual = (git rev-parse HEAD).Trim()
+
           Write-Host "========================================="
           Write-Host " BeeLlama source"
           Write-Host "========================================="
+          Write-Host "Expected: $expected"
+          Write-Host "Actual:   $actual"
 
-          git remote -v
-
-          Write-Host ""
-          Write-Host "Version:"
-          $version = (git describe --tags --always).Trim()
-          Write-Host $version
-
-          Write-Host ""
-          Write-Host "Commit:"
-          $commit = (git rev-parse HEAD).Trim()
-          Write-Host $commit
-
-          if ($version -notmatch "^preview-v0\.4\.7") {
-              Write-Error "Wrong BeeLlama version."
-              Write-Error "Expected: preview-v0.4.7"
-              Write-Error "Actual:   $version"
+          if ($actual -ne $expected) {
+              Write-Error "Unexpected BeeLlama commit."
               exit 1
           }
 
           Write-Host ""
-          Write-Host "BeeLlama v0.4.7 Preview source verification OK."
+          git describe --tags --always
+          git log -1 --oneline
+
+          "commit=$actual" >> $env:GITHUB_OUTPUT
+
 
       # ============================================================
-      # Codex Responses API compatibility patch
+      # Verify original Codex patch target exists
       # ============================================================
-      - name: Patch Codex tool output compatibility
+
+      - name: Verify Codex patch target
         shell: pwsh
         run: |
           $path = "tools/server/server-chat.cpp"
@@ -69,14 +72,32 @@ jobs:
 
           $content = Get-Content $path -Raw
 
-          Write-Host "========================================="
-          Write-Host " Original Codex patch target"
-          Write-Host "========================================="
+          if (-not $content.Contains("Output of tool call should be 'Input text'")) {
+              Write-Error "Expected Codex patch target was not found."
+              exit 1
+          }
 
-          Select-String `
-              -Path $path `
-              -Pattern "Output of tool call|input_text|chatcmpl_output" `
-              -Context 10,10
+          Write-Host "Codex patch target found."
+
+
+      # ============================================================
+      # Codex Responses API compatibility patch
+      #
+      # Supports function_call_output content:
+      #
+      #   raw string
+      #   input_text
+      #   output_text
+      #   text
+      #   input_image
+      #
+      # ============================================================
+
+      - name: Patch Codex tool output compatibility
+        shell: pwsh
+        run: |
+          $path = "tools/server/server-chat.cpp"
+          $content = Get-Content $path -Raw
 
           $pattern = 'if\s*\(\s*!chatcmpl_output\.contains\("type"\)\s*\|\|\s*chatcmpl_output\.at\("type"\)\s*!=\s*"input_text"\s*\)\s*\{\s*throw\s+std::invalid_argument\("Output of tool call should be ''Input text''"\);\s*\}\s*chatcmpl_output\["type"\]\s*=\s*"text"\s*;'
 
@@ -96,16 +117,21 @@ jobs:
               if (type == "input_text" ||
                   type == "output_text" ||
                   type == "text") {
+
                   if (!chatcmpl_output.contains("text") ||
                       !chatcmpl_output.at("text").is_string()) {
+
                       throw std::invalid_argument(
                           "Tool output text block requires 'text'");
                   }
 
                   chatcmpl_output["type"] = "text";
+
               } else if (type == "input_image") {
+
                   if (!chatcmpl_output.contains("image_url") ||
                       !chatcmpl_output.at("image_url").is_string()) {
+
                       throw std::invalid_argument(
                           "Tool output image block requires string 'image_url'");
                   }
@@ -119,11 +145,15 @@ jobs:
                           {"url", url}
                       }}
                   };
+
               } else {
+
                   throw std::invalid_argument(
                       "Unsupported tool output content type: " + type);
               }
+
           } else {
+
               throw std::invalid_argument(
                   "Unsupported tool output content");
           }
@@ -138,14 +168,14 @@ jobs:
 
           if ($patched -eq $content) {
               Write-Host ""
-              Write-Host "Patch target was not found."
+              Write-Host "Patch target was not replaced."
 
               Select-String `
                   -Path $path `
-                  -Pattern "Output of tool call|input_text|chatcmpl_output" `
+                  -Pattern "Output of tool call|chatcmpl_output" `
                   -Context 20,20
 
-              Write-Error "Codex compatibility patch was NOT applied."
+              Write-Error "Codex compatibility patch failed."
               exit 1
           }
 
@@ -155,57 +185,61 @@ jobs:
               -NoNewline `
               -Encoding UTF8
 
-          Write-Host ""
           Write-Host "========================================="
-          Write-Host " Patch applied"
+          Write-Host " Codex patch applied"
           Write-Host "========================================="
 
           git diff -- $path
 
+
       # ============================================================
       # Verify Codex patch
       # ============================================================
+
       - name: Verify Codex patch
         shell: pwsh
         run: |
           $path = "tools/server/server-chat.cpp"
           $content = Get-Content $path -Raw
 
-          if (-not $content.Contains("Codex function_call_output item")) {
-              Write-Error "Debug logging was not found."
-              exit 1
-          }
+          $required = @(
+              "Codex function_call_output item",
+              'type == "input_image"',
+              'type == "output_text"',
+              '{"type", "image_url"}'
+          )
 
-          if (-not $content.Contains('type == "input_image"')) {
-              Write-Error "input_image support was not found."
-              exit 1
-          }
-
-          if (-not $content.Contains('{"type", "image_url"}')) {
-              Write-Error "image_url conversion was not found."
-              exit 1
-          }
-
-          if (-not $content.Contains('type == "output_text"')) {
-              Write-Error "output_text support was not found."
-              exit 1
+          foreach ($item in $required) {
+              if (-not $content.Contains($item)) {
+                  Write-Error "Codex patch verification failed: $item"
+                  exit 1
+              }
           }
 
           Write-Host "Codex compatibility patch verification OK."
 
+
       # ============================================================
-      # Install CUDA 12.4
+      # CUDA 12.4.1
+      #
+      # External GitHub Action.
+      # No dependency on local .github/actions directory.
+      #
       # ============================================================
-      - name: Install CUDA Toolkit 12.4
-        uses: ./.github/actions/windows-setup-cuda
+
+      - name: Install CUDA Toolkit 12.4.1
+        id: cuda-toolkit
+        uses: Jimver/cuda-toolkit@v0.2.36
         with:
-          cuda_version: '12.4'
-          cuda_arch: 'x64'
+          cuda: '12.4.1'
+          method: 'network'
+
 
       # ============================================================
       # Verify CUDA
       # ============================================================
-      - name: Verify CUDA
+
+      - name: Verify CUDA 12.4
         shell: pwsh
         run: |
           Write-Host "========================================="
@@ -215,62 +249,99 @@ jobs:
           Write-Host "CUDA_PATH=$env:CUDA_PATH"
 
           where.exe nvcc
-          nvcc --version
+
+          $nvcc = (& nvcc --version 2>&1 | Out-String)
+
+          Write-Host $nvcc
+
+          if ($nvcc -notmatch "release 12\.4") {
+              Write-Error "Expected CUDA 12.4."
+              exit 1
+          }
 
           if (-not (Test-Path "$env:CUDA_PATH\bin\nvcc.exe")) {
-              Write-Error "nvcc.exe was not found."
+              Write-Error "nvcc.exe was not found under CUDA_PATH."
               exit 1
           }
 
-          $nvccOutput = (nvcc --version | Out-String)
+          Write-Host "CUDA 12.4 OK."
 
-          if ($nvccOutput -notmatch "release 12\.4") {
-              Write-Error "CUDA 12.4 was expected."
-              Write-Error $nvccOutput
+
+      # ============================================================
+      # Resolve Visual Studio dynamically
+      #
+      # windows-2022 currently has VS Enterprise 2022,
+      # but use vswhere instead of hard-coding edition path.
+      #
+      # ============================================================
+
+      - name: Resolve Visual Studio
+        id: vs
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+
+          if (-not (Test-Path $vswhere)) {
+              Write-Error "vswhere.exe was not found."
               exit 1
           }
 
-          Write-Host ""
-          Write-Host "CUDA 12.4 verification OK."
+          $vsPath = & $vswhere `
+              -latest `
+              -products * `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+              -property installationPath
+
+          $vsPath = $vsPath.Trim()
+
+          if (-not $vsPath) {
+              Write-Error "Visual Studio installation was not found."
+              exit 1
+          }
+
+          $vcvars = Join-Path `
+              $vsPath `
+              "VC\Auxiliary\Build\vcvarsall.bat"
+
+          if (-not (Test-Path $vcvars)) {
+              Write-Error "vcvarsall.bat was not found: $vcvars"
+              exit 1
+          }
+
+          Write-Host "Visual Studio:"
+          Write-Host $vsPath
+
+          Write-Host "vcvarsall:"
+          Write-Host $vcvars
+
+          "path=$vsPath" >> $env:GITHUB_OUTPUT
+
 
       # ============================================================
-      # Install Ninja
+      # Ninja
       # ============================================================
+
       - name: Install Ninja
         shell: pwsh
         run: |
-          choco install ninja -y
+          choco install ninja -y --no-progress
+
+          where.exe ninja
           ninja --version
 
-      # ============================================================
-      # Get source commit
-      # ============================================================
-      - name: Get source commit
-        id: source
-        shell: pwsh
-        run: |
-          $commit = (git rev-parse --short=12 HEAD).Trim()
-
-          Write-Host "Commit: $commit"
-
-          "commit=$commit" | Out-File `
-              -FilePath $env:GITHUB_OUTPUT `
-              -Append `
-              -Encoding utf8
 
       # ============================================================
-      # Restore build cache
+      # Build cache
       # ============================================================
+
       - name: Restore build cache
         id: build-cache
         uses: actions/cache@v4
         with:
           path: build
-          key: beellama-preview-v047-${{ steps.source.outputs.commit }}-win2022-cuda124-sm75-sm89-faoff-v2
+          key: beellama-1156b183630e-win2022-cuda1241-sm75-sm89-faoff-v2
 
-      # ============================================================
-      # Show cache status
-      # ============================================================
+
       - name: Show cache status
         shell: pwsh
         run: |
@@ -285,27 +356,56 @@ jobs:
               Write-Host "CACHE MISS"
           }
 
+
       # ============================================================
-      # Configure
+      # Configure BeeLlama
+      #
+      # RTX 2080 Ti       = sm_75
+      # RTX 4070 Ti SUPER = sm_89
+      #
       # ============================================================
+
       - name: Configure BeeLlama
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          set "VS_PATH=${{ steps.vs.outputs.path }}"
 
-          echo ===== Compiler =====
+          call "%VS_PATH%\VC\Auxiliary\Build\vcvarsall.bat" x64
+          if errorlevel 1 exit /b 1
+
+          echo =========================================
+          echo Compiler
+          echo =========================================
+
           where cl
+          if errorlevel 1 exit /b 1
+
           cl
 
-          echo ===== CUDA =====
+
+          echo =========================================
+          echo CUDA
+          echo =========================================
+
           where nvcc
+          if errorlevel 1 exit /b 1
+
           nvcc --version
 
-          echo ===== Ninja =====
+
+          echo =========================================
+          echo Ninja
+          echo =========================================
+
           where ninja
+          if errorlevel 1 exit /b 1
+
           ninja --version
 
-          echo ===== Configure =====
+
+          echo =========================================
+          echo Configure
+          echo =========================================
 
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DGGML_CUDA=ON ^
@@ -317,9 +417,11 @@ jobs:
 
           if errorlevel 1 exit /b 1
 
+
       # ============================================================
-      # Verify CMake configuration
+      # Verify CMake options
       # ============================================================
+
       - name: Verify CMake configuration
         shell: pwsh
         run: |
@@ -330,46 +432,78 @@ jobs:
               exit 1
           }
 
-          Write-Host ""
-          Write-Host "Relevant CMake options:"
+          Write-Host "========================================="
+          Write-Host " CMake configuration"
+          Write-Host "========================================="
 
           Select-String `
               -Path $cache `
               -Pattern "CMAKE_CUDA_ARCHITECTURES|GGML_CUDA_FA_ALL_QUANTS|GGML_CUDA_FA:|GGML_CUDA:"
+
+          $cuda = Select-String `
+              -Path $cache `
+              -Pattern "^GGML_CUDA:"
+
+          if (-not $cuda -or $cuda.Line -notmatch "=ON") {
+              Write-Error "GGML_CUDA is not ON."
+              exit 1
+          }
+
+
+          $fa = Select-String `
+              -Path $cache `
+              -Pattern "^GGML_CUDA_FA:"
+
+          if (-not $fa -or $fa.Line -notmatch "=ON") {
+              Write-Error "GGML_CUDA_FA is not ON."
+              exit 1
+          }
+
+
+          $allQuants = Select-String `
+              -Path $cache `
+              -Pattern "^GGML_CUDA_FA_ALL_QUANTS:"
+
+          if (-not $allQuants -or $allQuants.Line -notmatch "=OFF") {
+              Write-Error "GGML_CUDA_FA_ALL_QUANTS is not OFF."
+              exit 1
+          }
+
 
           $arch = Select-String `
               -Path $cache `
               -Pattern "^CMAKE_CUDA_ARCHITECTURES"
 
           if (-not $arch) {
-              Write-Error "CMAKE_CUDA_ARCHITECTURES was not found."
+              Write-Error "CMAKE_CUDA_ARCHITECTURES not found."
               exit 1
           }
 
           if ($arch.Line -notmatch "75-real;89-real") {
-              Write-Error "Expected CUDA architectures 75-real;89-real."
+              Write-Error "Expected 75-real;89-real."
               exit 1
           }
 
-          $quant = Select-String `
-              -Path $cache `
-              -Pattern "^GGML_CUDA_FA_ALL_QUANTS"
-
-          if ($quant -and $quant.Line -notmatch "OFF") {
-              Write-Error "GGML_CUDA_FA_ALL_QUANTS is not OFF."
-              exit 1
-          }
 
           Write-Host ""
           Write-Host "CMake configuration OK."
 
+
       # ============================================================
-      # Build llama-server
+      # Build llama-server only
       # ============================================================
+
       - name: Build llama-server
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          set "VS_PATH=${{ steps.vs.outputs.path }}"
+
+          call "%VS_PATH%\VC\Auxiliary\Build\vcvarsall.bat" x64
+          if errorlevel 1 exit /b 1
+
+          echo =========================================
+          echo Build llama-server
+          echo =========================================
 
           cmake --build build ^
             --config Release ^
@@ -378,64 +512,77 @@ jobs:
 
           if errorlevel 1 exit /b 1
 
+
       # ============================================================
-      # Show build output
+      # Locate output
       # ============================================================
+
       - name: Show build output
         shell: pwsh
         run: |
+          Write-Host "========================================="
+          Write-Host " Build output"
+          Write-Host "========================================="
+
           Get-ChildItem `
-              build\bin `
+              build `
               -Recurse `
-              -File
+              -File |
+              Where-Object {
+                  $_.Name -eq "llama-server.exe" -or
+                  $_.Extension -eq ".dll"
+              } |
+              Select-Object FullName
+
 
       # ============================================================
-      # Verify built binary
+      # Verify -ubd
       #
-      # This is the authoritative -bd / -ubd check.
+      # IMPORTANT:
+      #
+      # Check:
+      #   --spec-draft-ubatch-size
+      #   -ubd
+      #
+      # Do NOT require:
+      #   --spec-draft-batch-size
+      #   -bd
+      #
       # ============================================================
-      - name: Verify v0.4.7 Preview binary
+
+      - name: Verify draft ubatch option
         shell: pwsh
         run: |
-          if (Test-Path "build\bin\Release\llama-server.exe") {
-              $server = "build\bin\Release\llama-server.exe"
-          }
-          elseif (Test-Path "build\bin\llama-server.exe") {
-              $server = "build\bin\llama-server.exe"
-          }
-          else {
+          $server = Get-ChildItem `
+              build `
+              -Recurse `
+              -Filter "llama-server.exe" `
+              -File |
+              Select-Object -First 1
+
+          if (-not $server) {
               Write-Error "llama-server.exe was not found."
               exit 1
           }
 
-          Write-Host "========================================="
-          Write-Host " Binary"
-          Write-Host "========================================="
-          Write-Host $server
-
+          Write-Host "Server:"
+          Write-Host $server.FullName
           Write-Host ""
-          Write-Host "========================================="
-          Write-Host " Version"
-          Write-Host "========================================="
 
-          $versionOutput = (& $server --version 2>&1 | Out-String)
-          Write-Host $versionOutput
+          $helpOutput = (& $server.FullName --help 2>&1 | Out-String)
 
-          Write-Host ""
           Write-Host "========================================="
-          Write-Host " Draft batch options"
+          Write-Host " Draft ubatch option"
           Write-Host "========================================="
 
-          $helpOutput = (& $server --help 2>&1 | Out-String)
-
-          $helpOutput -split "`r?`n" |
+          $matches = $helpOutput -split "`r?`n" |
               Select-String `
-                  -Pattern "spec-draft-batch-size|spec-draft-ubatch-size|-bd|-ubd"
+                  -Pattern "spec-draft-ubatch-size|-ubd"
 
-          if ($helpOutput -notmatch "spec-draft-batch-size") {
-              Write-Error "--spec-draft-batch-size / -bd was NOT found."
-              exit 1
-          }
+          $matches |
+              ForEach-Object {
+                  Write-Host $_.Line
+              }
 
           if ($helpOutput -notmatch "spec-draft-ubatch-size") {
               Write-Error "--spec-draft-ubatch-size / -ubd was NOT found."
@@ -443,15 +590,37 @@ jobs:
           }
 
           Write-Host ""
-          Write-Host "========================================="
-          Write-Host " v0.4.7 Preview verification PASSED"
-          Write-Host "========================================="
-          Write-Host "-bd  : supported"
-          Write-Host "-ubd : supported"
+          Write-Host "OK: -ubd is available."
+
 
       # ============================================================
-      # Create package
+      # Show speculative options
       # ============================================================
+
+      - name: Show speculative options
+        shell: pwsh
+        run: |
+          $server = Get-ChildItem `
+              build `
+              -Recurse `
+              -Filter "llama-server.exe" `
+              -File |
+              Select-Object -First 1
+
+          $helpOutput = (& $server.FullName --help 2>&1 | Out-String)
+
+          $helpOutput -split "`r?`n" |
+              Select-String `
+                  -Pattern "spec-draft|draft-device|draft-ngl|ubd" |
+              ForEach-Object {
+                  Write-Host $_.Line
+              }
+
+
+      # ============================================================
+      # Package
+      # ============================================================
+
       - name: Create package
         shell: pwsh
         run: |
@@ -469,26 +638,42 @@ jobs:
               -Force |
               Out-Null
 
-          if (Test-Path "build\bin\Release\llama-server.exe") {
-              $bin = "build\bin\Release"
-          }
-          elseif (Test-Path "build\bin\llama-server.exe") {
-              $bin = "build\bin"
-          }
-          else {
-              Write-Error "Built llama-server.exe was not found."
+
+          # ----------------------------------------------------------
+          # Find llama-server.exe
+          # ----------------------------------------------------------
+
+          $server = Get-ChildItem `
+              build `
+              -Recurse `
+              -Filter "llama-server.exe" `
+              -File |
+              Select-Object -First 1
+
+          if (-not $server) {
+              Write-Error "llama-server.exe was not found."
               exit 1
           }
 
-          $server = Join-Path $bin "llama-server.exe"
+          $bin = $server.Directory.FullName
 
-          Write-Host "Using binary directory:"
+          Write-Host "Binary directory:"
           Write-Host $bin
 
+
+          # ----------------------------------------------------------
+          # EXE
+          # ----------------------------------------------------------
+
           Copy-Item `
-              $server `
+              $server.FullName `
               -Destination $package `
               -Force
+
+
+          # ----------------------------------------------------------
+          # DLLs
+          # ----------------------------------------------------------
 
           Get-ChildItem `
               $bin `
@@ -498,169 +683,247 @@ jobs:
                   -Destination $package `
                   -Force
 
+
+          # ----------------------------------------------------------
+          # Source commit
+          # ----------------------------------------------------------
+
           git rev-parse HEAD |
               Out-File `
                   "$package\source-commit.txt" `
                   -Encoding ascii
+
+
+          # ----------------------------------------------------------
+          # Source version
+          # ----------------------------------------------------------
 
           git describe --tags --always |
               Out-File `
                   "$package\source-version.txt" `
                   -Encoding ascii
 
-          git diff |
+
+          # ----------------------------------------------------------
+          # Codex patch
+          # ----------------------------------------------------------
+
+          git diff -- tools/server/server-chat.cpp |
               Out-File `
                   "$package\codex-tool-output-image-fix.patch" `
                   -Encoding utf8
 
-          & $server --version 2>&1 |
+
+          # ----------------------------------------------------------
+          # Binary version
+          # ----------------------------------------------------------
+
+          (& $server.FullName --version 2>&1 | Out-String) |
               Out-File `
                   "$package\llama-server-version.txt" `
                   -Encoding utf8
 
-          & $server --help 2>&1 |
+
+          # ----------------------------------------------------------
+          # Draft options
+          # ----------------------------------------------------------
+
+          $helpOutput = (& $server.FullName --help 2>&1 | Out-String)
+
+          $helpOutput -split "`r?`n" |
               Select-String `
-                  -Pattern "spec-draft-batch-size|spec-draft-ubatch-size|-bd|-ubd" |
+                  -Pattern "spec-draft|draft-device|draft-ngl|ubd" |
+              ForEach-Object {
+                  $_.Line
+              } |
               Out-File `
-                  "$package\draft-batch-options.txt" `
+                  "$package\draft-options.txt" `
                   -Encoding utf8
 
-          nvcc --version |
+
+          # ----------------------------------------------------------
+          # CUDA version
+          # ----------------------------------------------------------
+
+          (& nvcc --version 2>&1 | Out-String) |
               Out-File `
                   "$package\cuda-version.txt" `
                   -Encoding utf8
 
-          $sourceCommit = (git rev-parse HEAD).Trim()
-          $sourceVersion = (git describe --tags --always).Trim()
+
+          # ----------------------------------------------------------
+          # Visual Studio path
+          # ----------------------------------------------------------
 
           @"
-          BeeLlama v0.4.7 Preview custom build
+          ${{ steps.vs.outputs.path }}
+          "@ |
+              Out-File `
+                  "$package\visual-studio-path.txt" `
+                  -Encoding utf8
+
+
+          # ----------------------------------------------------------
+          # Build info
+          # ----------------------------------------------------------
+
+          @"
+          BeeLlama v0.4.7 Preview pinned build
+          =====================================
 
           Source repository:
-          https://github.com/Anbeeld/beellama.cpp
-
-          Source ref:
-          preview-v0.4.7
-
-          Source version:
-          $sourceVersion
+          Anbeeld/beellama.cpp
 
           Source commit:
-          $sourceCommit
+          1156b183630eb8bd76ff931348d0b1a258ae171b
 
-          NOTE:
-          preview-v0.4.7 is a rolling preview.
-          Commit may change between builds.
 
-          Platform:
-          Windows x64
+          Feature required:
 
-          Compiler:
-          MSVC / Visual Studio 2022
+          --spec-draft-ubatch-size
+          -ubd
+
+
+          Draft sizing behavior:
+
+          Target logical batch:
+          inherited from -b
+
+          Target physical ubatch:
+          -ub
+
+          Draft physical ubatch:
+          -ubd
+
+
+          Example:
+
+          -b 2048
+          -ub 1024
+          -ubd 128
+
+
+          OS:
+          Windows Server 2022
+
+          Runner:
+          windows-2022
+
 
           CUDA:
-          12.4
+          12.4.1
+
 
           CUDA architectures:
-          sm75-real
-          sm89-real
 
-          Target GPUs:
+          75-real
           RTX 2080 Ti
+
+          89-real
           RTX 4070 Ti SUPER
 
+
+          Build target:
+          llama-server
+
+
           Build options:
+
           GGML_CUDA=ON
           GGML_NATIVE=OFF
           GGML_CUDA_FA=ON
           GGML_CUDA_FA_ALL_QUANTS=OFF
           LLAMA_BUILD_TESTS=OFF
+
           CMAKE_CUDA_ARCHITECTURES=75-real;89-real
 
-          Built target:
-          llama-server
 
-          Required draft options:
-          --spec-draft-batch-size / -bd
-          --spec-draft-ubatch-size / -ubd
+          Codex Responses compatibility:
 
-          Codex Responses API compatibility patch:
-          - raw string
-          - input_text
-          - output_text
-          - text
-          - input_image
+          raw string
+          input_text
+          output_text
+          text
+          input_image
+
+
           "@ |
               Out-File `
                   "$package\BUILD-INFO.txt" `
                   -Encoding utf8
 
+
       # ============================================================
-      # Verify packaged binary
+      # Verify package
       # ============================================================
-      - name: Verify packaged binary
+
+      - name: Verify package
         shell: pwsh
         run: |
-          $server = "package\llama-server.exe"
-
-          if (-not (Test-Path $server)) {
-              Write-Error "Packaged llama-server.exe was not found."
-              exit 1
-          }
-
-          if (-not (Test-Path "package\ggml-cuda.dll")) {
-              Write-Error "ggml-cuda.dll was not packaged."
-              exit 1
-          }
-
           Write-Host "========================================="
-          Write-Host " Packaged version"
+          Write-Host " Package"
           Write-Host "========================================="
-
-          & $server --version
-
-          Write-Host ""
-          Write-Host "========================================="
-          Write-Host " Packaged draft options"
-          Write-Host "========================================="
-
-          $helpOutput = (& $server --help 2>&1 | Out-String)
-
-          $helpOutput -split "`r?`n" |
-              Select-String `
-                  -Pattern "spec-draft-batch-size|spec-draft-ubatch-size|-bd|-ubd"
-
-          if ($helpOutput -notmatch "spec-draft-batch-size") {
-              Write-Error "Packaged EXE has no -bd support."
-              exit 1
-          }
-
-          if ($helpOutput -notmatch "spec-draft-ubatch-size") {
-              Write-Error "Packaged EXE has no -ubd support."
-              exit 1
-          }
-
-          Write-Host ""
-          Write-Host "Packaged files:"
 
           Get-ChildItem `
               package `
               -File |
-              Sort-Object Name
+              Sort-Object Name |
+              Select-Object Name, Length
+
+
+          $requiredFiles = @(
+              "package\llama-server.exe",
+              "package\draft-options.txt",
+              "package\BUILD-INFO.txt",
+              "package\source-commit.txt",
+              "package\codex-tool-output-image-fix.patch"
+          )
+
+          foreach ($file in $requiredFiles) {
+              if (-not (Test-Path $file)) {
+                  Write-Error "Missing package file: $file"
+                  exit 1
+              }
+          }
+
+
+          $cudaDll = Get-ChildItem `
+              package `
+              -Filter "ggml-cuda.dll" `
+              -File `
+              -ErrorAction SilentlyContinue
+
+          if (-not $cudaDll) {
+              Write-Error "ggml-cuda.dll was not packaged."
+              exit 1
+          }
+
+
+          $draftOptions = Get-Content `
+              "package\draft-options.txt" `
+              -Raw
+
+          if ($draftOptions -notmatch "spec-draft-ubatch-size") {
+              Write-Error "-ubd was not preserved in draft-options.txt."
+              exit 1
+          }
+
 
           Write-Host ""
-          Write-Host "PACKAGE VERIFICATION PASSED."
+          Write-Host "Package verification OK."
+
 
       # ============================================================
-      # Create ZIP
+      # ZIP
       # ============================================================
+
       - name: Create ZIP
-        id: zip
         shell: pwsh
         run: |
-          $commit = (git rev-parse --short=8 HEAD).Trim()
+          $commit = "${{ steps.source.outputs.commit }}"
+          $short = $commit.Substring(0, 12)
 
-          $zip = "beellama-preview-v0.4.7-$commit-codex-cuda12.4-sm75-sm89.zip"
+          $zip = "beellama-preview-v0.4.7-$short-ubd-codex-cuda12.4-sm75-sm89.zip"
 
           Remove-Item `
               $zip `
@@ -672,7 +935,6 @@ jobs:
               -DestinationPath $zip `
               -Force
 
-          Write-Host ""
           Write-Host "========================================="
           Write-Host " ZIP"
           Write-Host "========================================="
@@ -682,17 +944,14 @@ jobs:
                   Name,
                   @{N="MiB";E={[math]::Round($_.Length / 1MB, 2)}}
 
-          "zip=$zip" | Out-File `
-              -FilePath $env:GITHUB_OUTPUT `
-              -Append `
-              -Encoding utf8
 
       # ============================================================
       # Upload artifact
       # ============================================================
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: beellama-preview-v0.4.7-${{ steps.source.outputs.commit }}-codex-cuda12.4-sm75-sm89
-          path: ${{ steps.zip.outputs.zip }}
+          name: beellama-preview-v0.4.7-1156b183630e-ubd-codex-cuda12.4-sm75-sm89
+          path: beellama-preview-v0.4.7-1156b183630e-ubd-codex-cuda12.4-sm75-sm89.zip
           if-no-files-found: error
