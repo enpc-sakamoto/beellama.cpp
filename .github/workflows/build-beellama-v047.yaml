@@ -1,4 +1,4 @@
-name: Build BeeLlama v0.4.7 Preview ubd Codex Fix CUDA 12.4 sm75 sm89
+name: Build BeeLlama v0.4.7 Preview ubd Codex CUDA12.4 sm75 sm89
 
 on:
   workflow_dispatch:
@@ -10,9 +10,11 @@ jobs:
     steps:
 
       # ============================================================
-      # Checkout BeeLlama
+      # Checkout BeeLlama pinned commit
       #
-      # Pin commit containing:
+      # v0.4.7 Preview
+      # includes:
+      #
       #   --spec-draft-ubatch-size
       #   -ubd
       #
@@ -31,7 +33,7 @@ jobs:
       # Verify source commit
       # ============================================================
 
-      - name: Verify pinned BeeLlama commit
+      - name: Verify pinned commit
         id: source
         shell: pwsh
         run: |
@@ -41,6 +43,7 @@ jobs:
           Write-Host "========================================="
           Write-Host " BeeLlama source"
           Write-Host "========================================="
+
           Write-Host "Expected: $expected"
           Write-Host "Actual:   $actual"
 
@@ -57,7 +60,7 @@ jobs:
 
 
       # ============================================================
-      # Verify original Codex patch target exists
+      # Codex patch target check
       # ============================================================
 
       - name: Verify Codex patch target
@@ -72,18 +75,27 @@ jobs:
 
           $content = Get-Content $path -Raw
 
+          Write-Host "========================================="
+          Write-Host " Codex patch target"
+          Write-Host "========================================="
+
+          Select-String `
+              -Path $path `
+              -Pattern "Output of tool call|input_text|chatcmpl_output" `
+              -Context 10,10
+
           if (-not $content.Contains("Output of tool call should be 'Input text'")) {
               Write-Error "Expected Codex patch target was not found."
               exit 1
           }
 
-          Write-Host "Codex patch target found."
+          Write-Host "Codex patch target OK."
 
 
       # ============================================================
       # Codex Responses API compatibility patch
       #
-      # Supports function_call_output content:
+      # Supports:
       #
       #   raw string
       #   input_text
@@ -110,6 +122,7 @@ jobs:
                   {"type", "text"},
                   {"text", chatcmpl_output.get<std::string>()}
               };
+
           } else if (chatcmpl_output.is_object()) {
               const std::string type =
                   json_value(chatcmpl_output, "type", std::string());
@@ -120,7 +133,6 @@ jobs:
 
                   if (!chatcmpl_output.contains("text") ||
                       !chatcmpl_output.at("text").is_string()) {
-
                       throw std::invalid_argument(
                           "Tool output text block requires 'text'");
                   }
@@ -131,7 +143,6 @@ jobs:
 
                   if (!chatcmpl_output.contains("image_url") ||
                       !chatcmpl_output.at("image_url").is_string()) {
-
                       throw std::invalid_argument(
                           "Tool output image block requires string 'image_url'");
                   }
@@ -147,13 +158,11 @@ jobs:
                   };
 
               } else {
-
                   throw std::invalid_argument(
                       "Unsupported tool output content type: " + type);
               }
 
           } else {
-
               throw std::invalid_argument(
                   "Unsupported tool output content");
           }
@@ -220,47 +229,43 @@ jobs:
 
 
       # ============================================================
-      # CUDA 12.4.1
+      # CUDA
       #
-      # External GitHub Action.
-      # No dependency on local .github/actions directory.
+      # NO CUDA INSTALL HERE.
+      #
+      # Use existing CUDA environment.
+      # Require CUDA 12.4.
       #
       # ============================================================
 
-      - name: Install CUDA Toolkit 12.4.1
-        id: cuda-toolkit
-        uses: Jimver/cuda-toolkit@v0.2.36
-        with:
-          cuda: '12.4.1'
-          method: 'network'
-
-
-      # ============================================================
-      # Verify CUDA
-      # ============================================================
-
-      - name: Verify CUDA 12.4
+      - name: Verify existing CUDA 12.4
         shell: pwsh
         run: |
           Write-Host "========================================="
-          Write-Host " CUDA"
+          Write-Host " Existing CUDA environment"
           Write-Host "========================================="
 
           Write-Host "CUDA_PATH=$env:CUDA_PATH"
 
-          where.exe nvcc
+          $nvccCmd = Get-Command nvcc `
+              -ErrorAction SilentlyContinue
 
-          $nvcc = (& nvcc --version 2>&1 | Out-String)
-
-          Write-Host $nvcc
-
-          if ($nvcc -notmatch "release 12\.4") {
-              Write-Error "Expected CUDA 12.4."
+          if (-not $nvccCmd) {
+              Write-Error "nvcc was not found in PATH."
               exit 1
           }
 
-          if (-not (Test-Path "$env:CUDA_PATH\bin\nvcc.exe")) {
-              Write-Error "nvcc.exe was not found under CUDA_PATH."
+          Write-Host ""
+          Write-Host "nvcc:"
+          Write-Host $nvccCmd.Source
+
+          $nvcc = (& nvcc --version 2>&1 | Out-String)
+
+          Write-Host ""
+          Write-Host $nvcc
+
+          if ($nvcc -notmatch "release 12\.4") {
+              Write-Error "CUDA 12.4 is required but the active nvcc is not CUDA 12.4."
               exit 1
           }
 
@@ -269,10 +274,6 @@ jobs:
 
       # ============================================================
       # Resolve Visual Studio dynamically
-      #
-      # windows-2022 currently has VS Enterprise 2022,
-      # but use vswhere instead of hard-coding edition path.
-      #
       # ============================================================
 
       - name: Resolve Visual Studio
@@ -311,6 +312,7 @@ jobs:
           Write-Host "Visual Studio:"
           Write-Host $vsPath
 
+          Write-Host ""
           Write-Host "vcvarsall:"
           Write-Host $vcvars
 
@@ -324,7 +326,12 @@ jobs:
       - name: Install Ninja
         shell: pwsh
         run: |
-          choco install ninja -y --no-progress
+          $ninja = Get-Command ninja `
+              -ErrorAction SilentlyContinue
+
+          if (-not $ninja) {
+              choco install ninja -y --no-progress
+          }
 
           where.exe ninja
           ninja --version
@@ -339,7 +346,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build
-          key: beellama-1156b183630e-win2022-cuda1241-sm75-sm89-faoff-v2
+          key: beellama-1156b183630e-win2022-cuda124-sm75-sm89-faoff-v3
 
 
       - name: Show cache status
@@ -358,7 +365,7 @@ jobs:
 
 
       # ============================================================
-      # Configure BeeLlama
+      # Configure
       #
       # RTX 2080 Ti       = sm_75
       # RTX 4070 Ti SUPER = sm_89
@@ -419,7 +426,7 @@ jobs:
 
 
       # ============================================================
-      # Verify CMake options
+      # Verify CMake configuration
       # ============================================================
 
       - name: Verify CMake configuration
@@ -475,15 +482,14 @@ jobs:
               -Pattern "^CMAKE_CUDA_ARCHITECTURES"
 
           if (-not $arch) {
-              Write-Error "CMAKE_CUDA_ARCHITECTURES not found."
+              Write-Error "CMAKE_CUDA_ARCHITECTURES was not found."
               exit 1
           }
 
           if ($arch.Line -notmatch "75-real;89-real") {
-              Write-Error "Expected 75-real;89-real."
+              Write-Error "Expected CUDA architectures 75-real;89-real."
               exit 1
           }
-
 
           Write-Host ""
           Write-Host "CMake configuration OK."
@@ -514,7 +520,7 @@ jobs:
 
 
       # ============================================================
-      # Locate output
+      # Show output
       # ============================================================
 
       - name: Show build output
@@ -538,15 +544,15 @@ jobs:
       # ============================================================
       # Verify -ubd
       #
-      # IMPORTANT:
+      # Verify ONLY:
       #
-      # Check:
       #   --spec-draft-ubatch-size
       #   -ubd
       #
-      # Do NOT require:
-      #   --spec-draft-batch-size
+      # There is no requirement for:
+      #
       #   -bd
+      #   --spec-draft-batch-size
       #
       # ============================================================
 
@@ -565,14 +571,17 @@ jobs:
               exit 1
           }
 
-          Write-Host "Server:"
+          Write-Host "========================================="
+          Write-Host " llama-server"
+          Write-Host "========================================="
+
           Write-Host $server.FullName
-          Write-Host ""
 
           $helpOutput = (& $server.FullName --help 2>&1 | Out-String)
 
+          Write-Host ""
           Write-Host "========================================="
-          Write-Host " Draft ubatch option"
+          Write-Host " Draft ubatch"
           Write-Host "========================================="
 
           $matches = $helpOutput -split "`r?`n" |
@@ -594,10 +603,10 @@ jobs:
 
 
       # ============================================================
-      # Show speculative options
+      # Show useful draft options
       # ============================================================
 
-      - name: Show speculative options
+      - name: Show speculative draft options
         shell: pwsh
         run: |
           $server = Get-ChildItem `
@@ -608,6 +617,10 @@ jobs:
               Select-Object -First 1
 
           $helpOutput = (& $server.FullName --help 2>&1 | Out-String)
+
+          Write-Host "========================================="
+          Write-Host " Draft options"
+          Write-Host "========================================="
 
           $helpOutput -split "`r?`n" |
               Select-String `
@@ -640,7 +653,7 @@ jobs:
 
 
           # ----------------------------------------------------------
-          # Find llama-server.exe
+          # Find llama-server
           # ----------------------------------------------------------
 
           $server = Get-ChildItem `
@@ -685,18 +698,13 @@ jobs:
 
 
           # ----------------------------------------------------------
-          # Source commit
+          # Source information
           # ----------------------------------------------------------
 
           git rev-parse HEAD |
               Out-File `
                   "$package\source-commit.txt" `
                   -Encoding ascii
-
-
-          # ----------------------------------------------------------
-          # Source version
-          # ----------------------------------------------------------
 
           git describe --tags --always |
               Out-File `
@@ -752,7 +760,7 @@ jobs:
 
 
           # ----------------------------------------------------------
-          # Visual Studio path
+          # Visual Studio
           # ----------------------------------------------------------
 
           @"
@@ -764,33 +772,36 @@ jobs:
 
 
           # ----------------------------------------------------------
-          # Build info
+          # Build information
           # ----------------------------------------------------------
 
           @"
           BeeLlama v0.4.7 Preview pinned build
           =====================================
 
-          Source repository:
+          Source:
           Anbeeld/beellama.cpp
 
-          Source commit:
+          Commit:
           1156b183630eb8bd76ff931348d0b1a258ae171b
 
 
-          Feature required:
+          Required feature:
 
           --spec-draft-ubatch-size
           -ubd
 
 
-          Draft sizing behavior:
+          Draft batch behavior:
 
           Target logical batch:
-          inherited from -b
+          -b
 
           Target physical ubatch:
           -ub
+
+          Draft logical batch:
+          inherits target -b
 
           Draft physical ubatch:
           -ubd
@@ -803,15 +814,11 @@ jobs:
           -ubd 128
 
 
-          OS:
-          Windows Server 2022
-
-          Runner:
-          windows-2022
-
-
           CUDA:
-          12.4.1
+          existing CUDA 12.4 environment
+
+          No CUDA installation is performed
+          by this workflow.
 
 
           CUDA architectures:
@@ -838,14 +845,13 @@ jobs:
           CMAKE_CUDA_ARCHITECTURES=75-real;89-real
 
 
-          Codex Responses compatibility:
+          Codex Responses API compatibility:
 
           raw string
           input_text
           output_text
           text
           input_image
-
 
           "@ |
               Out-File `
