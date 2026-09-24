@@ -229,20 +229,30 @@ jobs:
 
 
       # ============================================================
-      # CUDA
+      # CUDA 12.4.1
       #
-      # NO CUDA INSTALL HERE.
-      #
-      # Use existing CUDA environment.
-      # Require CUDA 12.4.
+      # Install explicitly because windows-2022 does not expose nvcc
+      # in PATH by default.
       #
       # ============================================================
 
-      - name: Verify existing CUDA 12.4
+      - name: Install CUDA Toolkit 12.4.1
+        id: cuda-toolkit
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '12.4.1'
+          method: 'network'
+
+
+      # ============================================================
+      # Verify CUDA 12.4
+      # ============================================================
+
+      - name: Verify CUDA 12.4
         shell: pwsh
         run: |
           Write-Host "========================================="
-          Write-Host " Existing CUDA environment"
+          Write-Host " CUDA environment"
           Write-Host "========================================="
 
           Write-Host "CUDA_PATH=$env:CUDA_PATH"
@@ -251,7 +261,7 @@ jobs:
               -ErrorAction SilentlyContinue
 
           if (-not $nvccCmd) {
-              Write-Error "nvcc was not found in PATH."
+              Write-Error "nvcc was not found in PATH after CUDA installation."
               exit 1
           }
 
@@ -346,7 +356,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build
-          key: beellama-1156b183630e-win2022-cuda124-sm75-sm89-faoff-v3
+          key: beellama-1156b183630e-win2022-cuda1241-sm75-sm89-faoff-v4
 
 
       - name: Show cache status
@@ -543,17 +553,6 @@ jobs:
 
       # ============================================================
       # Verify -ubd
-      #
-      # Verify ONLY:
-      #
-      #   --spec-draft-ubatch-size
-      #   -ubd
-      #
-      # There is no requirement for:
-      #
-      #   -bd
-      #   --spec-draft-batch-size
-      #
       # ============================================================
 
       - name: Verify draft ubatch option
@@ -603,7 +602,7 @@ jobs:
 
 
       # ============================================================
-      # Show useful draft options
+      # Show speculative draft options
       # ============================================================
 
       - name: Show speculative draft options
@@ -815,10 +814,7 @@ jobs:
 
 
           CUDA:
-          existing CUDA 12.4 environment
-
-          No CUDA installation is performed
-          by this workflow.
+          CUDA Toolkit 12.4.1 installed by workflow
 
 
           CUDA architectures:
