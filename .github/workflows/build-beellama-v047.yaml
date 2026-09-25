@@ -11,7 +11,7 @@ jobs:
     steps:
 
       # ============================================================
-      # Checkout
+      # Checkout BeeLlama pinned commit
       # ============================================================
 
       - name: Checkout BeeLlama pinned commit
@@ -24,7 +24,7 @@ jobs:
 
 
       # ============================================================
-      # Verify source
+      # Verify source commit
       # ============================================================
 
       - name: Verify pinned commit
@@ -53,7 +53,7 @@ jobs:
 
 
       # ============================================================
-      # Codex patch target
+      # Verify Codex patch target
       # ============================================================
 
       - name: Verify Codex patch target
@@ -213,14 +213,14 @@ jobs:
 
 
       # ============================================================
-      # Show NVFP4 source locations before patch
+      # Show NVFP4 references before patch
       # ============================================================
 
-      - name: Show NVFP4 source locations
+      - name: Show NVFP4 references before patch
         shell: pwsh
         run: |
           Write-Host "========================================="
-          Write-Host " NVFP4 source references"
+          Write-Host " NVFP4 references before patch"
           Write-Host "========================================="
 
           Get-ChildItem `
@@ -236,11 +236,16 @@ jobs:
       # ============================================================
       # Disable NVFP4 MMQ
       #
-      # No CMakeLists.txt string replacement.
+      # Remove:
       #
-      # 1. Delete the actual CUDA template instance source
-      # 2. Remove its extern declaration
-      # 3. Remove MMQ dispatch case
+      #   mmq-instance-nvfp4.cu
+      #
+      #   extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
+      #
+      #   case GGML_TYPE_NVFP4:
+      #       ...
+      #       break;
+      #
       # ============================================================
 
       - name: Disable NVFP4 MMQ
@@ -256,7 +261,7 @@ jobs:
 
 
           # --------------------------------------------------------
-          # Verify files
+          # Verify required files
           # --------------------------------------------------------
 
           foreach ($file in @($nvfp4, $cuh, $cu)) {
@@ -268,11 +273,11 @@ jobs:
 
 
           # --------------------------------------------------------
-          # Remove NVFP4 CUDA compilation unit
+          # Remove CUDA template instance source
           # --------------------------------------------------------
 
           Write-Host ""
-          Write-Host "Removing:"
+          Write-Host "Removing CUDA source:"
           Write-Host $nvfp4
 
           Remove-Item `
@@ -280,96 +285,162 @@ jobs:
               -Force
 
           if (Test-Path $nvfp4) {
-              Write-Error "Failed to remove $nvfp4"
+              Write-Error "Failed to remove NVFP4 CUDA source."
               exit 1
           }
 
 
           # --------------------------------------------------------
-          # Show relevant mmq.cuh lines
+          # Remove extern declaration from mmq.cuh
           # --------------------------------------------------------
 
           Write-Host ""
-          Write-Host "mmq.cuh before patch:"
+          Write-Host "NVFP4 references in mmq.cuh before patch:"
 
           Select-String `
               -Path $cuh `
               -Pattern "NVFP4" `
-              -Context 3,3
+              -Context 2,2
 
+          $lines = @(Get-Content $cuh)
 
-          # --------------------------------------------------------
-          # Remove declaration from mmq.cuh
-          # --------------------------------------------------------
-
-          $content = Get-Content $cuh -Raw
-          $before  = $content
-
-          $content = [regex]::Replace(
-              $content,
-              '(?m)^[ \t]*extern[ \t]+DECL_MMQ_CASE\(GGML_TYPE_NVFP4\);[ \t]*\r?\n?',
-              ''
+          $filtered = @(
+              $lines | Where-Object {
+                  $_ -notmatch 'DECL_MMQ_CASE\s*\(\s*GGML_TYPE_NVFP4\s*\)'
+              }
           )
 
-          if ($content -eq $before) {
-              Write-Error "NVFP4 DECL_MMQ_CASE declaration was not found in mmq.cuh."
+          if ($filtered.Count -eq $lines.Count) {
+              Write-Error "NVFP4 declaration was not found in mmq.cuh."
               exit 1
           }
 
-          Set-Content `
-              -Path $cuh `
-              -Value $content `
-              -NoNewline `
-              -Encoding UTF8
+          $filtered |
+              Set-Content `
+                  -Path $cuh `
+                  -Encoding UTF8
 
 
           # --------------------------------------------------------
-          # Show relevant mmq.cu lines
+          # Show dispatcher before removal
           # --------------------------------------------------------
 
           Write-Host ""
-          Write-Host "mmq.cu before patch:"
+          Write-Host "NVFP4 references in mmq.cu before patch:"
 
           Select-String `
               -Path $cu `
-              -Pattern "NVFP4" `
+              -Pattern "GGML_TYPE_NVFP4" `
               -Context 4,4
 
 
           # --------------------------------------------------------
-          # Remove dispatcher from mmq.cu
+          # Remove NVFP4 case block
+          #
+          # Start:
+          #
+          #   case GGML_TYPE_NVFP4:
+          #
+          # Continue skipping until the first:
+          #
+          #   break;
+          #
+          # This is intentionally not dependent on exact body shape.
           # --------------------------------------------------------
 
-          $content = Get-Content $cu -Raw
-          $before  = $content
+          $lines = @(Get-Content $cu)
 
-          $pattern = '(?ms)^[ \t]*case[ \t]+GGML_TYPE_NVFP4[ \t]*:[ \t]*\r?\n[ \t]*mul_mat_q_case<GGML_TYPE_NVFP4>[ \t]*\([ \t]*ctx[ \t]*,[ \t]*args[ \t]*,[ \t]*stream[ \t]*\)[ \t]*;[ \t]*\r?\n[ \t]*break[ \t]*;[ \t]*\r?\n?'
+          $result = New-Object System.Collections.Generic.List[string]
 
-          $content = [regex]::Replace(
-              $content,
-              $pattern,
-              ''
-          )
+          $insideNvfp4Case = $false
+          $foundCase = $false
+          $foundBreak = $false
 
-          if ($content -eq $before) {
-              Write-Error "NVFP4 MMQ dispatcher was not found in mmq.cu."
+          foreach ($line in $lines) {
+
+              if (-not $insideNvfp4Case) {
+
+                  if ($line -match '^\s*case\s+GGML_TYPE_NVFP4\s*:') {
+
+                      $foundCase = $true
+                      $insideNvfp4Case = $true
+
+                      Write-Host ""
+                      Write-Host "Removing NVFP4 case block starting at:"
+                      Write-Host $line
+
+                      continue
+                  }
+
+                  $result.Add($line)
+                  continue
+              }
+
+
+              # We are inside NVFP4 case block.
+
+              Write-Host "  REMOVE: $line"
+
+              if ($line -match '^\s*break\s*;\s*$') {
+                  $foundBreak = $true
+                  $insideNvfp4Case = $false
+              }
+          }
+
+
+          if (-not $foundCase) {
+              Write-Error "NVFP4 dispatcher case was not found in mmq.cu."
               exit 1
           }
 
-          Set-Content `
-              -Path $cu `
-              -Value $content `
-              -NoNewline `
-              -Encoding UTF8
+          if (-not $foundBreak) {
+              Write-Error "NVFP4 dispatcher break statement was not found."
+              exit 1
+          }
+
+          if ($insideNvfp4Case) {
+              Write-Error "NVFP4 dispatcher block did not terminate."
+              exit 1
+          }
+
+
+          $result |
+              Set-Content `
+                  -Path $cu `
+                  -Encoding UTF8
 
 
           # --------------------------------------------------------
-          # Diff
+          # Display remaining references
           # --------------------------------------------------------
 
           Write-Host ""
           Write-Host "========================================="
-          Write-Host " NVFP4 patch diff"
+          Write-Host " Remaining NVFP4 references"
+          Write-Host "========================================="
+
+          Write-Host ""
+          Write-Host "mmq.cuh:"
+
+          Select-String `
+              -Path $cuh `
+              -Pattern "GGML_TYPE_NVFP4" `
+              -Context 2,2 `
+              -ErrorAction SilentlyContinue
+
+          Write-Host ""
+          Write-Host "mmq.cu:"
+
+          Select-String `
+              -Path $cu `
+              -Pattern "GGML_TYPE_NVFP4" `
+              -Context 2,2 `
+              -ErrorAction SilentlyContinue
+
+
+          Write-Host ""
+          Write-Host "========================================="
+          Write-Host " Patch diff"
           Write-Host "========================================="
 
           git diff -- `
@@ -380,6 +451,15 @@ jobs:
 
       # ============================================================
       # Verify NVFP4 MMQ exclusion
+      #
+      # Other NVFP4 references may remain.
+      #
+      # We only require:
+      #
+      #   instance .cu absent
+      #   DECL_MMQ_CASE absent
+      #   case GGML_TYPE_NVFP4 absent
+      #
       # ============================================================
 
       - name: Verify NVFP4 MMQ exclusion
@@ -399,19 +479,39 @@ jobs:
               exit 1
           }
 
-          $cuhContent = Get-Content $cuh -Raw
-          $cuContent  = Get-Content $cu -Raw
 
-          if ($cuhContent -match 'DECL_MMQ_CASE\(GGML_TYPE_NVFP4\)') {
+          $cuhContent = Get-Content $cuh -Raw
+
+          if ($cuhContent -match 'DECL_MMQ_CASE\s*\(\s*GGML_TYPE_NVFP4\s*\)') {
+
+              Select-String `
+                  -Path $cuh `
+                  -Pattern "NVFP4" `
+                  -Context 3,3
+
               Write-Error "NVFP4 declaration still exists in mmq.cuh."
               exit 1
           }
 
+
+          $cuContent = Get-Content $cu -Raw
+
           if ($cuContent -match 'case\s+GGML_TYPE_NVFP4\s*:') {
+
+              Write-Host ""
+              Write-Host "Remaining dispatcher:"
+
+              Select-String `
+                  -Path $cu `
+                  -Pattern "case\s+GGML_TYPE_NVFP4" `
+                  -Context 5,10
+
               Write-Error "NVFP4 dispatcher still exists in mmq.cu."
               exit 1
           }
 
+
+          Write-Host ""
           Write-Host "NVFP4 MMQ exclusion OK."
 
 
@@ -530,12 +630,13 @@ jobs:
 
 
       # ============================================================
-      # Restore cache
+      # Restore build cache
       #
-      # Separate key:
-      #   CUDA 13.3
-      #   sm75 + sm89
-      #   NVFP4 OFF
+      # New cache key:
+      #
+      # CUDA 13.3
+      # sm75 + sm89
+      # NVFP4 MMQ OFF
       # ============================================================
 
       - name: Restore build cache
@@ -543,7 +644,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: build
-          key: beellama-1156b183630e-win2022-cuda133-sm75-sm89-nvfp4off-faoff-v2
+          key: beellama-1156b183630e-win2022-cuda133-sm75-sm89-nvfp4off-faoff-v3
 
 
       - name: Show cache status
@@ -567,7 +668,7 @@ jobs:
       # RTX 2080 Ti       = sm75
       # RTX 4070 Ti SUPER = sm89
       #
-      # sm86 / RTX 3080 Ti is NOT included.
+      # sm86 / RTX 3080 Ti NOT included.
       # ============================================================
 
       - name: Configure BeeLlama
@@ -621,7 +722,7 @@ jobs:
 
 
       # ============================================================
-      # Verify CMake
+      # Verify CMake configuration
       # ============================================================
 
       - name: Verify CMake configuration
@@ -715,9 +816,9 @@ jobs:
 
 
       # ============================================================
-      # Save cache immediately after successful build
+      # Save build cache immediately after successful build
       #
-      # This happens BEFORE version / -ubd verification.
+      # Before any runtime/version verification.
       # ============================================================
 
       - name: Save build cache
@@ -725,7 +826,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: build
-          key: beellama-1156b183630e-win2022-cuda133-sm75-sm89-nvfp4off-faoff-v2
+          key: beellama-1156b183630e-win2022-cuda133-sm75-sm89-nvfp4off-faoff-v3
 
 
       # ============================================================
@@ -751,10 +852,10 @@ jobs:
 
 
       # ============================================================
-      # Binary version
+      # Show binary version
       #
-      # WARNING ONLY.
-      # Does not kill the workflow.
+      # Diagnostic only.
+      # NEVER kill artifact generation.
       # ============================================================
 
       - name: Show binary version
@@ -795,8 +896,8 @@ jobs:
       # ============================================================
       # Verify -ubd
       #
-      # WARNING / diagnostic only.
-      # Artifact is preserved even if this fails.
+      # Diagnostic only.
+      # Artifact creation continues on failure.
       # ============================================================
 
       - name: Verify draft ubatch option
@@ -840,7 +941,7 @@ jobs:
       # ============================================================
       # Create package
       #
-      # Run even when diagnostic verification failed.
+      # Runs even if version / -ubd diagnostics fail.
       # ============================================================
 
       - name: Create package
@@ -906,18 +1007,13 @@ jobs:
 
 
           # --------------------------------------------------------
-          # Source commit
+          # Source information
           # --------------------------------------------------------
 
           git rev-parse HEAD |
               Out-File `
                   "$package\source-commit.txt" `
                   -Encoding ascii
-
-
-          # --------------------------------------------------------
-          # Source version
-          # --------------------------------------------------------
 
           git describe --tags --always |
               Out-File `
@@ -926,12 +1022,14 @@ jobs:
 
 
           # --------------------------------------------------------
-          # Complete build patch
+          # Complete patch
           #
           # Includes:
-          #   Codex patch
-          #   NVFP4 deletion
-          #   NVFP4 dispatcher removal
+          #
+          # Codex patch
+          # NVFP4 .cu deletion
+          # NVFP4 declaration removal
+          # NVFP4 dispatch removal
           # --------------------------------------------------------
 
           git diff |
@@ -990,7 +1088,7 @@ jobs:
 
 
           # --------------------------------------------------------
-          # Build info
+          # Build information
           # --------------------------------------------------------
 
           @"
@@ -1023,8 +1121,14 @@ jobs:
           NVFP4 MMQ:
           DISABLED
 
-          Removed source:
+          Removed:
           ggml/src/ggml-cuda/template-instances/mmq-instance-nvfp4.cu
+
+          Removed declaration:
+          DECL_MMQ_CASE(GGML_TYPE_NVFP4)
+
+          Removed dispatcher:
+          case GGML_TYPE_NVFP4
 
           Build options:
 
@@ -1101,9 +1205,9 @@ jobs:
 
 
       # ============================================================
-      # Upload ZIP
+      # Upload ZIP artifact
       #
-      # Runs even if version / -ubd verification failed.
+      # Runs even if diagnostics failed.
       # ============================================================
 
       - name: Upload ZIP artifact
@@ -1117,9 +1221,10 @@ jobs:
 
 
       # ============================================================
-      # Emergency raw binary artifact
+      # Emergency raw artifact
       #
-      # Protects against ZIP/package problems.
+      # If ZIP/package logic fails after successful compilation,
+      # preserve EXE + DLLs directly.
       # ============================================================
 
       - name: Upload raw build output
