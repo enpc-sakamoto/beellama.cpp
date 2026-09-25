@@ -14,25 +14,40 @@ jobs:
       # Checkout BeeLlama pinned commit
       # ============================================================
 
-      - name: Checkout BeeLlama pinned commit
+      - name: Checkout BeeLlama repository
         uses: actions/checkout@v4
         with:
           repository: Anbeeld/beellama.cpp
-          ref: 4c007d272841
           fetch-depth: 0
           submodules: recursive
 
 
       # ============================================================
-      # Verify source commit
+      # Checkout and verify pinned preview commit
       # ============================================================
 
-      - name: Verify pinned commit
+      - name: Checkout pinned preview commit
         id: source
         shell: pwsh
         run: |
           $expected = "4c007d272841"
-          $actual = (git rev-parse HEAD).Trim()
+
+          git fetch --all --tags --force
+          git checkout $expected
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "Unable to checkout BeeLlama commit $expected."
+              exit 1
+          }
+
+          git submodule sync --recursive
+          git submodule update --init --recursive
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "Submodule update failed."
+              exit 1
+          }
+
+          $actual = (git rev-parse --short=12 HEAD).Trim()
+          $actualFull = (git rev-parse HEAD).Trim()
 
           Write-Host "========================================="
           Write-Host " BeeLlama source"
@@ -40,6 +55,7 @@ jobs:
 
           Write-Host "Expected: $expected"
           Write-Host "Actual:   $actual"
+          Write-Host "Full:     $actualFull"
 
           if ($actual -ne $expected) {
               Write-Error "Unexpected BeeLlama commit."
@@ -49,7 +65,7 @@ jobs:
           git describe --tags --always
           git log -1 --oneline
 
-          "commit=$actual" >> $env:GITHUB_OUTPUT
+          "commit=$actualFull" >> $env:GITHUB_OUTPUT
 
 
       # ============================================================
