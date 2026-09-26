@@ -1,4 +1,4 @@
-name: Build BeeLlama v0.4.7 Preview ubd Codex CUDA13.3 sm75 sm89 no-NVFP4 mmqfix
+name: Build BeeLlama v0.4.7 Preview ubd Codex CUDA13.3 sm86 sm89 no-NVFP4 mmqfix
 
 on:
   workflow_dispatch:
@@ -708,7 +708,7 @@ jobs:
       # New cache key:
       #
       # CUDA 13.3
-      # sm75 + sm89
+      # sm86 + sm89
       # NVFP4 MMQ OFF
       # ============================================================
 
@@ -717,9 +717,10 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: build
-          key: beellama-4c007d272841-win2022-cuda133-sm75-sm89-nvfp4off-mmqfix-faoff-v4
-          # 修正前 (MMQ 無効化版) のビルドキャッシュが残っていれば再利用する。
-          # 同一 commit・同一 CMake 設定のため、差分は mmq.cu のみ。
+          key: beellama-4c007d272841-win2022-cuda133-sm86-sm89-nvfp4off-mmqfix-faoff-v4
+          # 修正前 (sm75+sm89, MMQ 無効化版) のビルドキャッシュが残っていれば再利用する。
+          # CUDA arch 変更で nvcc のコマンドラインが変わるため、CUDA オブジェクトは
+          # Ninja が全て再コンパイルする。再利用できるのは C/C++ オブジェクトのみ。
           restore-keys: |
             beellama-4c007d272841-win2022-cuda133-sm75-sm89-nvfp4off-faoff-v3
 
@@ -797,10 +798,10 @@ jobs:
       # ============================================================
       # Configure
       #
-      # RTX 2080 Ti       = sm75
+      # RTX 3080 Ti       = sm86
       # RTX 4070 Ti SUPER = sm89
       #
-      # sm86 / RTX 3080 Ti NOT included.
+      # sm75 / RTX 2080 Ti NOT included.
       # ============================================================
 
       - name: Configure BeeLlama
@@ -848,7 +849,7 @@ jobs:
             -DGGML_CUDA_FA=ON ^
             -DGGML_CUDA_FA_ALL_QUANTS=OFF ^
             -DLLAMA_BUILD_TESTS=OFF ^
-            -DCMAKE_CUDA_ARCHITECTURES="75-real;89-real"
+            -DCMAKE_CUDA_ARCHITECTURES="86-real;89-real"
 
           if errorlevel 1 exit /b 1
 
@@ -914,8 +915,8 @@ jobs:
           Write-Host ""
           Write-Host $arch.Line
 
-          if ($arch.Line -notmatch "75-real;89-real") {
-              Write-Error "Expected CUDA architectures 75-real;89-real."
+          if ($arch.Line -notmatch "86-real;89-real") {
+              Write-Error "Expected CUDA architectures 86-real;89-real."
               exit 1
           }
 
@@ -958,7 +959,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: build
-          key: beellama-4c007d272841-win2022-cuda133-sm75-sm89-nvfp4off-mmqfix-faoff-v4
+          key: beellama-4c007d272841-win2022-cuda133-sm86-sm89-nvfp4off-mmqfix-faoff-v4
 
 
       # ============================================================
@@ -1238,13 +1239,13 @@ jobs:
 
           CUDA architectures:
 
-          75-real
-          RTX 2080 Ti
+          86-real
+          RTX 3080 Ti
 
           89-real
           RTX 4070 Ti SUPER
 
-          sm86 / RTX 3080 Ti:
+          sm75 / RTX 2080 Ti:
           NOT INCLUDED
 
           Build target:
@@ -1270,7 +1271,7 @@ jobs:
           GGML_CUDA_FA_ALL_QUANTS=OFF
           LLAMA_BUILD_TESTS=OFF
 
-          CMAKE_CUDA_ARCHITECTURES=75-real;89-real
+          CMAKE_CUDA_ARCHITECTURES=86-real;89-real
 
           Required BeeLlama option:
 
@@ -1314,7 +1315,7 @@ jobs:
               exit 0
           }
 
-          $zip = "beellama-preview-v0.4.7-4c007d272841-ubd-codex-cuda13.3-sm75-sm89-no-nvfp4-mmqfix.zip"
+          $zip = "beellama-preview-v0.4.7-4c007d272841-ubd-codex-cuda13.3-sm86-sm89-no-nvfp4-mmqfix.zip"
 
           Remove-Item `
               $zip `
@@ -1346,8 +1347,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: beellama-preview-v0.4.7-4c007d272841-ubd-codex-cuda13.3-sm75-sm89-no-nvfp4-mmqfix
-          path: beellama-preview-v0.4.7-4c007d272841-ubd-codex-cuda13.3-sm75-sm89-no-nvfp4-mmqfix.zip
+          name: beellama-preview-v0.4.7-4c007d272841-ubd-codex-cuda13.3-sm86-sm89-no-nvfp4-mmqfix
+          path: beellama-preview-v0.4.7-4c007d272841-ubd-codex-cuda13.3-sm86-sm89-no-nvfp4-mmqfix.zip
           if-no-files-found: warn
           retention-days: 14
 
@@ -1363,7 +1364,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: beellama-raw-build-4c007d272841-cuda13.3-sm75-sm89-no-nvfp4-mmqfix
+          name: beellama-raw-build-4c007d272841-cuda13.3-sm86-sm89-no-nvfp4-mmqfix
           path: |
             build/bin/Release/llama-server.exe
             build/bin/Release/*.dll
