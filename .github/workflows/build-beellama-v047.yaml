@@ -1,4 +1,4 @@
-name: Build BeeLlama v0.4.7 Preview ubd Codex CUDA13.3 sm75 sm89 no-NVFP4
+name: Build BeeLlama v0.4.7 Preview ubd Codex CUDA13.3 sm75 sm89 no-NVFP4 mmqfix
 
 on:
   workflow_dispatch:
@@ -351,17 +351,32 @@ jobs:
 
 
           # --------------------------------------------------------
-          # Remove NVFP4 case block
+          # Remove NVFP4 case labels
           #
-          # Start:
+          # mmq.cu has two kinds of NVFP4 case:
           #
-          #   case GGML_TYPE_NVFP4:
+          # 1. Own block (ggml_cuda_mul_mat_q_switch_type):
           #
-          # Continue skipping until the first:
+          #      case GGML_TYPE_NVFP4:
+          #          mul_mat_q_case<GGML_TYPE_NVFP4>(...);
+          #          break;
           #
-          #   break;
+          #    -> remove case .. break.
           #
-          # This is intentionally not dependent on exact body shape.
+          # 2. Fall-through group member (ggml_cuda_should_use_mmq):
+          #
+          #      case GGML_TYPE_MXFP4:
+          #      case GGML_TYPE_NVFP4:
+          #          mmq_supported = true;
+          #          break;
+          #
+          #    -> remove ONLY the case label.
+          #       The shared body is used by all other quant types.
+          #       Removing it disables MMQ for every type
+          #       (IQ3_XXS etc. fall back to cuBLAS).
+          #
+          # Rule: if the previous kept code line is a case label,
+          #       the NVFP4 case is a fall-through group member.
           # --------------------------------------------------------
 
           $lines = @(Get-Content $cu)
@@ -369,22 +384,37 @@ jobs:
           $result = New-Object System.Collections.Generic.List[string]
 
           $insideNvfp4Case = $false
-          $foundCase = $false
-          $foundBreak = $false
+          $removedBlocks = 0
+          $removedLabels = 0
 
           foreach ($line in $lines) {
 
               if (-not $insideNvfp4Case) {
 
-                  if ($line -match '^\s*case\s+GGML_TYPE_NVFP4\s*:') {
+                  if ($line -match '^\s*case\s+GGML_TYPE_NVFP4\s*:\s*$') {
 
-                      $foundCase = $true
-                      $insideNvfp4Case = $true
+                      # Find previous non-empty, non-comment line.
+                      $prev = ""
+                      for ($i = $result.Count - 1; $i -ge 0; $i--) {
+                          $t = $result[$i].Trim()
+                          if ($t -ne "" -and -not $t.StartsWith("//")) {
+                              $prev = $t
+                              break
+                          }
+                      }
 
                       Write-Host ""
-                      Write-Host "Removing NVFP4 case block starting at:"
-                      Write-Host $line
 
+                      if ($prev -match '^case\s+\w+\s*:$') {
+                          $removedLabels++
+                          Write-Host "Removing NVFP4 fall-through label only:"
+                          Write-Host "  REMOVE: $line"
+                          continue
+                      }
+
+                      $insideNvfp4Case = $true
+                      Write-Host "Removing NVFP4 case block starting at:"
+                      Write-Host "  REMOVE: $line"
                       continue
                   }
 
@@ -393,29 +423,34 @@ jobs:
               }
 
 
-              # We are inside NVFP4 case block.
+              # We are inside NVFP4 own case block.
 
               Write-Host "  REMOVE: $line"
 
+              if ($line -match '^\s*case\s+\w+\s*:' -or $line -match '^\s*default\s*:') {
+                  Write-Error "NVFP4 case block reached another label before break."
+                  exit 1
+              }
+
               if ($line -match '^\s*break\s*;\s*$') {
-                  $foundBreak = $true
+                  $removedBlocks++
                   $insideNvfp4Case = $false
               }
           }
 
 
-          if (-not $foundCase) {
-              Write-Error "NVFP4 dispatcher case was not found in mmq.cu."
-              exit 1
-          }
-
-          if (-not $foundBreak) {
-              Write-Error "NVFP4 dispatcher break statement was not found."
-              exit 1
-          }
-
           if ($insideNvfp4Case) {
               Write-Error "NVFP4 dispatcher block did not terminate."
+              exit 1
+          }
+
+          if ($removedBlocks -ne 1) {
+              Write-Error "Expected 1 NVFP4 dispatcher block, removed $removedBlocks."
+              exit 1
+          }
+
+          if ($removedLabels -ne 1) {
+              Write-Error "Expected 1 NVFP4 fall-through label, removed $removedLabels."
               exit 1
           }
 
@@ -525,6 +560,28 @@ jobs:
               Write-Error "NVFP4 dispatcher still exists in mmq.cu."
               exit 1
           }
+
+
+          # MMQ support switch must still enable MMQ for other types.
+          # (Broken patch removed the shared "mmq_supported = true; break;")
+
+          if ($cuContent -notmatch 'case\s+GGML_TYPE_MXFP4\s*:\s*\r?\n\s*mmq_supported\s*=\s*true\s*;\s*\r?\n\s*break\s*;') {
+
+              Select-String `
+                  -Path $cu `
+                  -Pattern "mmq_supported" `
+                  -Context 5,5
+
+              Write-Error "ggml_cuda_should_use_mmq: shared 'mmq_supported = true; break;' is broken."
+              exit 1
+          }
+
+          if ($cuContent -notmatch 'case\s+GGML_TYPE_MXFP4\s*:\s*\r?\n\s*mul_mat_q_case<GGML_TYPE_MXFP4>\(ctx,\s*args,\s*stream\)\s*;\s*\r?\n\s*break\s*;') {
+              Write-Error "ggml_cuda_mul_mat_q_switch_type: MXFP4 dispatcher is broken."
+              exit 1
+          }
+
+          Write-Host "MMQ support switch OK (other quant types keep MMQ)."
 
 
           Write-Host ""
@@ -660,7 +717,11 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: build
-          key: beellama-4c007d272841-win2022-cuda133-sm75-sm89-nvfp4off-faoff-v3
+          key: beellama-4c007d272841-win2022-cuda133-sm75-sm89-nvfp4off-mmqfix-faoff-v4
+          # 修正前 (MMQ 無効化版) のビルドキャッシュが残っていれば再利用する。
+          # 同一 commit・同一 CMake 設定のため、差分は mmq.cu のみ。
+          restore-keys: |
+            beellama-4c007d272841-win2022-cuda133-sm75-sm89-nvfp4off-faoff-v3
 
 
       - name: Show cache status
@@ -673,8 +734,63 @@ jobs:
           if ("${{ steps.build-cache.outputs.cache-hit }}" -eq "true") {
               Write-Host "CACHE HIT"
           }
+          elseif ("${{ steps.build-cache.outputs.cache-matched-key }}" -ne "") {
+              Write-Host "CACHE RESTORED FROM: ${{ steps.build-cache.outputs.cache-matched-key }}"
+          }
           else {
               Write-Host "CACHE MISS"
+          }
+
+
+      # ============================================================
+      # Normalize timestamps for cache reuse
+      #
+      # Ninja は mtime で再ビルド判定する。
+      # checkout 直後のソースと、ジョブ内でインストールした CUDA ヘッダは
+      # 復元したオブジェクトより新しくなるため、そのままでは全再ビルドになる。
+      #
+      # - 追跡ソースと CUDA include を固定の古い時刻にする
+      # - 修正前キャッシュと内容が異なる mmq.cu だけ現在時刻にして再コンパイルさせる
+      # - server-chat.cpp も念のため現在時刻 (llama-server 側のみで軽い)
+      # - mmq.cuh は修正前と同一ロジック・同一 commit で内容が同じため古い時刻のまま
+      #   (触ると MMQ テンプレートインスタンス全体が再コンパイルされる)
+      # ============================================================
+
+      - name: Normalize timestamps for cache reuse
+        if: steps.build-cache.outputs.cache-matched-key != ''
+        shell: pwsh
+        run: |
+          $old = [datetime]::new(2020, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
+          $now = [datetime]::UtcNow
+
+          $count = 0
+          foreach ($path in @(git ls-files --recurse-submodules)) {
+              if (Test-Path -LiteralPath $path -PathType Leaf) {
+                  (Get-Item -LiteralPath $path).LastWriteTimeUtc = $old
+                  $count++
+              }
+          }
+          Write-Host "Source files normalized: $count"
+
+          $cudaInclude = Join-Path $env:CUDA_PATH "include"
+          if (-not (Test-Path $cudaInclude)) {
+              Write-Error "CUDA include directory not found: $cudaInclude"
+              exit 1
+          }
+
+          $count = 0
+          Get-ChildItem $cudaInclude -Recurse -File | ForEach-Object {
+              $_.LastWriteTimeUtc = $old
+              $count++
+          }
+          Write-Host "CUDA headers normalized: $count"
+
+          foreach ($path in @(
+              "ggml/src/ggml-cuda/mmq.cu",
+              "tools/server/server-chat.cpp"
+          )) {
+              (Get-Item -LiteralPath $path).LastWriteTimeUtc = $now
+              Write-Host "Marked as changed: $path"
           }
 
 
@@ -842,7 +958,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: build
-          key: beellama-4c007d272841-win2022-cuda133-sm75-sm89-nvfp4off-faoff-v3
+          key: beellama-4c007d272841-win2022-cuda133-sm75-sm89-nvfp4off-mmqfix-faoff-v4
 
 
       # ============================================================
@@ -1144,7 +1260,7 @@ jobs:
           DECL_MMQ_CASE(GGML_TYPE_NVFP4)
 
           Removed dispatcher:
-          case GGML_TYPE_NVFP4
+          case GGML_TYPE_NVFP4 (ggml_cuda_mul_mat_q_switch_type block + ggml_cuda_should_use_mmq label only; MMQ kept for other types)
 
           Build options:
 
@@ -1198,7 +1314,7 @@ jobs:
               exit 0
           }
 
-          $zip = "beellama-preview-v0.4.7-4c007d272841-ubd-codex-cuda13.3-sm75-sm89-no-nvfp4.zip"
+          $zip = "beellama-preview-v0.4.7-4c007d272841-ubd-codex-cuda13.3-sm75-sm89-no-nvfp4-mmqfix.zip"
 
           Remove-Item `
               $zip `
@@ -1230,8 +1346,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: beellama-preview-v0.4.7-4c007d272841-ubd-codex-cuda13.3-sm75-sm89-no-nvfp4
-          path: beellama-preview-v0.4.7-4c007d272841-ubd-codex-cuda13.3-sm75-sm89-no-nvfp4.zip
+          name: beellama-preview-v0.4.7-4c007d272841-ubd-codex-cuda13.3-sm75-sm89-no-nvfp4-mmqfix
+          path: beellama-preview-v0.4.7-4c007d272841-ubd-codex-cuda13.3-sm75-sm89-no-nvfp4-mmqfix.zip
           if-no-files-found: warn
           retention-days: 14
 
@@ -1247,7 +1363,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: beellama-raw-build-4c007d272841-cuda13.3-sm75-sm89-no-nvfp4
+          name: beellama-raw-build-4c007d272841-cuda13.3-sm75-sm89-no-nvfp4-mmqfix
           path: |
             build/bin/Release/llama-server.exe
             build/bin/Release/*.dll
