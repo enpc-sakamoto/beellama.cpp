@@ -1,0 +1,1373 @@
+name: Build BeeLlama v0.4.7 Preview ubd Codex CUDA13.3 sm86only no-NVFP4 mmqfix
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+
+      # ============================================================
+      # Checkout BeeLlama pinned commit
+      # ============================================================
+
+      - name: Checkout BeeLlama repository
+        uses: actions/checkout@v4
+        with:
+          repository: Anbeeld/beellama.cpp
+          fetch-depth: 0
+          submodules: recursive
+
+
+      # ============================================================
+      # Checkout and verify pinned preview commit
+      # ============================================================
+
+      - name: Checkout pinned preview commit
+        id: source
+        shell: pwsh
+        run: |
+          $expected = "4c007d272841"
+
+          git fetch --all --tags --force
+          git checkout $expected
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "Unable to checkout BeeLlama commit $expected."
+              exit 1
+          }
+
+          git submodule sync --recursive
+          git submodule update --init --recursive
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "Submodule update failed."
+              exit 1
+          }
+
+          $actual = (git rev-parse --short=12 HEAD).Trim()
+          $actualFull = (git rev-parse HEAD).Trim()
+
+          Write-Host "========================================="
+          Write-Host " BeeLlama source"
+          Write-Host "========================================="
+
+          Write-Host "Expected: $expected"
+          Write-Host "Actual:   $actual"
+          Write-Host "Full:     $actualFull"
+
+          if ($actual -ne $expected) {
+              Write-Error "Unexpected BeeLlama commit."
+              exit 1
+          }
+
+          git describe --tags --always
+          git log -1 --oneline
+
+          "commit=$actualFull" >> $env:GITHUB_OUTPUT
+
+
+      # ============================================================
+      # Verify Codex patch target
+      # ============================================================
+
+      - name: Verify Codex patch target
+        shell: pwsh
+        run: |
+          $path = "tools/server/server-chat.cpp"
+
+          if (-not (Test-Path $path)) {
+              Write-Error "File not found: $path"
+              exit 1
+          }
+
+          $content = Get-Content $path -Raw
+
+          Write-Host "========================================="
+          Write-Host " Codex patch target"
+          Write-Host "========================================="
+
+          Select-String `
+              -Path $path `
+              -Pattern "Output of tool call|input_text|chatcmpl_output" `
+              -Context 10,10
+
+          if (-not $content.Contains("Output of tool call should be 'Input text'")) {
+              Write-Error "Expected Codex patch target was not found."
+              exit 1
+          }
+
+          Write-Host "Codex patch target OK."
+
+
+      # ============================================================
+      # Codex Responses API compatibility patch
+      # ============================================================
+
+      - name: Patch Codex tool output compatibility
+        shell: pwsh
+        run: |
+          $path = "tools/server/server-chat.cpp"
+          $content = Get-Content $path -Raw
+
+          $pattern = 'if\s*\(\s*!chatcmpl_output\.contains\("type"\)\s*\|\|\s*chatcmpl_output\.at\("type"\)\s*!=\s*"input_text"\s*\)\s*\{\s*throw\s+std::invalid_argument\("Output of tool call should be ''Input text''"\);\s*\}\s*chatcmpl_output\["type"\]\s*=\s*"text"\s*;'
+
+          $replacement = @'
+          SRV_WRN("Codex function_call_output item: %s\n",
+                  chatcmpl_output.dump().c_str());
+
+          if (chatcmpl_output.is_string()) {
+              chatcmpl_output = {
+                  {"type", "text"},
+                  {"text", chatcmpl_output.get<std::string>()}
+              };
+
+          } else if (chatcmpl_output.is_object()) {
+              const std::string type =
+                  json_value(chatcmpl_output, "type", std::string());
+
+              if (type == "input_text" ||
+                  type == "output_text" ||
+                  type == "text") {
+
+                  if (!chatcmpl_output.contains("text") ||
+                      !chatcmpl_output.at("text").is_string()) {
+                      throw std::invalid_argument(
+                          "Tool output text block requires 'text'");
+                  }
+
+                  chatcmpl_output["type"] = "text";
+
+              } else if (type == "input_image") {
+
+                  if (!chatcmpl_output.contains("image_url") ||
+                      !chatcmpl_output.at("image_url").is_string()) {
+                      throw std::invalid_argument(
+                          "Tool output image block requires string 'image_url'");
+                  }
+
+                  const std::string url =
+                      chatcmpl_output.at("image_url").get<std::string>();
+
+                  chatcmpl_output = {
+                      {"type", "image_url"},
+                      {"image_url", {
+                          {"url", url}
+                      }}
+                  };
+
+              } else {
+                  throw std::invalid_argument(
+                      "Unsupported tool output content type: " + type);
+              }
+
+          } else {
+              throw std::invalid_argument(
+                  "Unsupported tool output content");
+          }
+          '@
+
+          $patched = [regex]::Replace(
+              $content,
+              $pattern,
+              $replacement,
+              [System.Text.RegularExpressions.RegexOptions]::Singleline
+          )
+
+          if ($patched -eq $content) {
+              Write-Host ""
+              Write-Host "Patch target was not replaced."
+
+              Select-String `
+                  -Path $path `
+                  -Pattern "Output of tool call|chatcmpl_output" `
+                  -Context 20,20
+
+              Write-Error "Codex compatibility patch failed."
+              exit 1
+          }
+
+          Set-Content `
+              -Path $path `
+              -Value $patched `
+              -NoNewline `
+              -Encoding UTF8
+
+          Write-Host "========================================="
+          Write-Host " Codex patch applied"
+          Write-Host "========================================="
+
+          git diff -- $path
+
+
+      # ============================================================
+      # Verify Codex patch
+      # ============================================================
+
+      - name: Verify Codex patch
+        shell: pwsh
+        run: |
+          $path = "tools/server/server-chat.cpp"
+          $content = Get-Content $path -Raw
+
+          $required = @(
+              "Codex function_call_output item",
+              'type == "input_image"',
+              'type == "output_text"',
+              '{"type", "image_url"}'
+          )
+
+          foreach ($item in $required) {
+              if (-not $content.Contains($item)) {
+                  Write-Error "Codex patch verification failed: $item"
+                  exit 1
+              }
+          }
+
+          Write-Host "Codex compatibility patch verification OK."
+
+
+      # ============================================================
+      # Show NVFP4 references before patch
+      # ============================================================
+
+      - name: Show NVFP4 references before patch
+        shell: pwsh
+        run: |
+          Write-Host "========================================="
+          Write-Host " NVFP4 references before patch"
+          Write-Host "========================================="
+
+          Get-ChildItem `
+              "ggml/src/ggml-cuda" `
+              -Recurse `
+              -File |
+              Select-String `
+                  -Pattern "GGML_TYPE_NVFP4|mmq-instance-nvfp4" `
+                  -ErrorAction SilentlyContinue |
+              Select-Object Path, LineNumber, Line
+
+
+      # ============================================================
+      # Disable NVFP4 MMQ
+      #
+      # Remove:
+      #
+      #   mmq-instance-nvfp4.cu
+      #
+      #   extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
+      #
+      #   case GGML_TYPE_NVFP4:
+      #       ...
+      #       break;
+      #
+      # ============================================================
+
+      - name: Disable NVFP4 MMQ
+        shell: pwsh
+        run: |
+          $nvfp4 = "ggml/src/ggml-cuda/template-instances/mmq-instance-nvfp4.cu"
+          $cuh   = "ggml/src/ggml-cuda/mmq.cuh"
+          $cu    = "ggml/src/ggml-cuda/mmq.cu"
+
+          Write-Host "========================================="
+          Write-Host " Disable NVFP4 MMQ"
+          Write-Host "========================================="
+
+
+          # --------------------------------------------------------
+          # Verify required files
+          # --------------------------------------------------------
+
+          foreach ($file in @($nvfp4, $cuh, $cu)) {
+              if (-not (Test-Path $file)) {
+                  Write-Error "Required file not found: $file"
+                  exit 1
+              }
+          }
+
+
+          # --------------------------------------------------------
+          # Remove CUDA template instance source
+          # --------------------------------------------------------
+
+          Write-Host ""
+          Write-Host "Removing CUDA source:"
+          Write-Host $nvfp4
+
+          Remove-Item `
+              $nvfp4 `
+              -Force
+
+          if (Test-Path $nvfp4) {
+              Write-Error "Failed to remove NVFP4 CUDA source."
+              exit 1
+          }
+
+
+          # --------------------------------------------------------
+          # Remove extern declaration from mmq.cuh
+          # --------------------------------------------------------
+
+          Write-Host ""
+          Write-Host "NVFP4 references in mmq.cuh before patch:"
+
+          Select-String `
+              -Path $cuh `
+              -Pattern "NVFP4" `
+              -Context 2,2
+
+          $lines = @(Get-Content $cuh)
+
+          $filtered = @(
+              $lines | Where-Object {
+                  $_ -notmatch 'DECL_MMQ_CASE\s*\(\s*GGML_TYPE_NVFP4\s*\)'
+              }
+          )
+
+          if ($filtered.Count -eq $lines.Count) {
+              Write-Error "NVFP4 declaration was not found in mmq.cuh."
+              exit 1
+          }
+
+          $filtered |
+              Set-Content `
+                  -Path $cuh `
+                  -Encoding UTF8
+
+
+          # --------------------------------------------------------
+          # Show dispatcher before removal
+          # --------------------------------------------------------
+
+          Write-Host ""
+          Write-Host "NVFP4 references in mmq.cu before patch:"
+
+          Select-String `
+              -Path $cu `
+              -Pattern "GGML_TYPE_NVFP4" `
+              -Context 4,4
+
+
+          # --------------------------------------------------------
+          # Remove NVFP4 case labels
+          #
+          # mmq.cu has two kinds of NVFP4 case:
+          #
+          # 1. Own block (ggml_cuda_mul_mat_q_switch_type):
+          #
+          #      case GGML_TYPE_NVFP4:
+          #          mul_mat_q_case<GGML_TYPE_NVFP4>(...);
+          #          break;
+          #
+          #    -> remove case .. break.
+          #
+          # 2. Fall-through group member (ggml_cuda_should_use_mmq):
+          #
+          #      case GGML_TYPE_MXFP4:
+          #      case GGML_TYPE_NVFP4:
+          #          mmq_supported = true;
+          #          break;
+          #
+          #    -> remove ONLY the case label.
+          #       The shared body is used by all other quant types.
+          #       Removing it disables MMQ for every type
+          #       (IQ3_XXS etc. fall back to cuBLAS).
+          #
+          # Rule: if the previous kept code line is a case label,
+          #       the NVFP4 case is a fall-through group member.
+          # --------------------------------------------------------
+
+          $lines = @(Get-Content $cu)
+
+          $result = New-Object System.Collections.Generic.List[string]
+
+          $insideNvfp4Case = $false
+          $removedBlocks = 0
+          $removedLabels = 0
+
+          foreach ($line in $lines) {
+
+              if (-not $insideNvfp4Case) {
+
+                  if ($line -match '^\s*case\s+GGML_TYPE_NVFP4\s*:\s*$') {
+
+                      # Find previous non-empty, non-comment line.
+                      $prev = ""
+                      for ($i = $result.Count - 1; $i -ge 0; $i--) {
+                          $t = $result[$i].Trim()
+                          if ($t -ne "" -and -not $t.StartsWith("//")) {
+                              $prev = $t
+                              break
+                          }
+                      }
+
+                      Write-Host ""
+
+                      if ($prev -match '^case\s+\w+\s*:$') {
+                          $removedLabels++
+                          Write-Host "Removing NVFP4 fall-through label only:"
+                          Write-Host "  REMOVE: $line"
+                          continue
+                      }
+
+                      $insideNvfp4Case = $true
+                      Write-Host "Removing NVFP4 case block starting at:"
+                      Write-Host "  REMOVE: $line"
+                      continue
+                  }
+
+                  $result.Add($line)
+                  continue
+              }
+
+
+              # We are inside NVFP4 own case block.
+
+              Write-Host "  REMOVE: $line"
+
+              if ($line -match '^\s*case\s+\w+\s*:' -or $line -match '^\s*default\s*:') {
+                  Write-Error "NVFP4 case block reached another label before break."
+                  exit 1
+              }
+
+              if ($line -match '^\s*break\s*;\s*$') {
+                  $removedBlocks++
+                  $insideNvfp4Case = $false
+              }
+          }
+
+
+          if ($insideNvfp4Case) {
+              Write-Error "NVFP4 dispatcher block did not terminate."
+              exit 1
+          }
+
+          if ($removedBlocks -ne 1) {
+              Write-Error "Expected 1 NVFP4 dispatcher block, removed $removedBlocks."
+              exit 1
+          }
+
+          if ($removedLabels -ne 1) {
+              Write-Error "Expected 1 NVFP4 fall-through label, removed $removedLabels."
+              exit 1
+          }
+
+
+          $result |
+              Set-Content `
+                  -Path $cu `
+                  -Encoding UTF8
+
+
+          # --------------------------------------------------------
+          # Display remaining references
+          # --------------------------------------------------------
+
+          Write-Host ""
+          Write-Host "========================================="
+          Write-Host " Remaining NVFP4 references"
+          Write-Host "========================================="
+
+          Write-Host ""
+          Write-Host "mmq.cuh:"
+
+          Select-String `
+              -Path $cuh `
+              -Pattern "GGML_TYPE_NVFP4" `
+              -Context 2,2 `
+              -ErrorAction SilentlyContinue
+
+          Write-Host ""
+          Write-Host "mmq.cu:"
+
+          Select-String `
+              -Path $cu `
+              -Pattern "GGML_TYPE_NVFP4" `
+              -Context 2,2 `
+              -ErrorAction SilentlyContinue
+
+
+          Write-Host ""
+          Write-Host "========================================="
+          Write-Host " Patch diff"
+          Write-Host "========================================="
+
+          git diff -- `
+              ggml/src/ggml-cuda/mmq.cuh `
+              ggml/src/ggml-cuda/mmq.cu `
+              ggml/src/ggml-cuda/template-instances/mmq-instance-nvfp4.cu
+
+
+      # ============================================================
+      # Verify NVFP4 MMQ exclusion
+      #
+      # Other NVFP4 references may remain.
+      #
+      # We only require:
+      #
+      #   instance .cu absent
+      #   DECL_MMQ_CASE absent
+      #   case GGML_TYPE_NVFP4 absent
+      #
+      # ============================================================
+
+      - name: Verify NVFP4 MMQ exclusion
+        shell: pwsh
+        run: |
+          $nvfp4 = "ggml/src/ggml-cuda/template-instances/mmq-instance-nvfp4.cu"
+          $cuh   = "ggml/src/ggml-cuda/mmq.cuh"
+          $cu    = "ggml/src/ggml-cuda/mmq.cu"
+
+          Write-Host "========================================="
+          Write-Host " Verify NVFP4 MMQ exclusion"
+          Write-Host "========================================="
+
+
+          if (Test-Path $nvfp4) {
+              Write-Error "NVFP4 CUDA source still exists."
+              exit 1
+          }
+
+
+          $cuhContent = Get-Content $cuh -Raw
+
+          if ($cuhContent -match 'DECL_MMQ_CASE\s*\(\s*GGML_TYPE_NVFP4\s*\)') {
+
+              Select-String `
+                  -Path $cuh `
+                  -Pattern "NVFP4" `
+                  -Context 3,3
+
+              Write-Error "NVFP4 declaration still exists in mmq.cuh."
+              exit 1
+          }
+
+
+          $cuContent = Get-Content $cu -Raw
+
+          if ($cuContent -match 'case\s+GGML_TYPE_NVFP4\s*:') {
+
+              Write-Host ""
+              Write-Host "Remaining dispatcher:"
+
+              Select-String `
+                  -Path $cu `
+                  -Pattern "case\s+GGML_TYPE_NVFP4" `
+                  -Context 5,10
+
+              Write-Error "NVFP4 dispatcher still exists in mmq.cu."
+              exit 1
+          }
+
+
+          # MMQ support switch must still enable MMQ for other types.
+          # (Broken patch removed the shared "mmq_supported = true; break;")
+
+          if ($cuContent -notmatch 'case\s+GGML_TYPE_MXFP4\s*:\s*\r?\n\s*mmq_supported\s*=\s*true\s*;\s*\r?\n\s*break\s*;') {
+
+              Select-String `
+                  -Path $cu `
+                  -Pattern "mmq_supported" `
+                  -Context 5,5
+
+              Write-Error "ggml_cuda_should_use_mmq: shared 'mmq_supported = true; break;' is broken."
+              exit 1
+          }
+
+          if ($cuContent -notmatch 'case\s+GGML_TYPE_MXFP4\s*:\s*\r?\n\s*mul_mat_q_case<GGML_TYPE_MXFP4>\(ctx,\s*args,\s*stream\)\s*;\s*\r?\n\s*break\s*;') {
+              Write-Error "ggml_cuda_mul_mat_q_switch_type: MXFP4 dispatcher is broken."
+              exit 1
+          }
+
+          Write-Host "MMQ support switch OK (other quant types keep MMQ)."
+
+
+          Write-Host ""
+          Write-Host "NVFP4 MMQ exclusion OK."
+
+
+      # ============================================================
+      # CUDA 13.3
+      # ============================================================
+
+      - name: Install CUDA Toolkit 13.3
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '13.3'
+          cuda_arch: 'x64'
+
+
+      # ============================================================
+      # Verify CUDA
+      # ============================================================
+
+      - name: Verify CUDA
+        shell: pwsh
+        run: |
+          Write-Host "========================================="
+          Write-Host " CUDA"
+          Write-Host "========================================="
+
+          Write-Host "CUDA_PATH=$env:CUDA_PATH"
+
+          $nvcc = Get-Command nvcc `
+              -ErrorAction SilentlyContinue
+
+          if (-not $nvcc) {
+              Write-Error "nvcc was not found."
+              exit 1
+          }
+
+          Write-Host ""
+          Write-Host "nvcc:"
+          Write-Host $nvcc.Source
+
+          $version = (& nvcc --version 2>&1 | Out-String)
+
+          Write-Host ""
+          Write-Host $version
+
+          if ($version -notmatch 'release 13\.3') {
+              Write-Error "CUDA 13.3 is required."
+              exit 1
+          }
+
+          Write-Host "CUDA 13.3 OK."
+
+
+      # ============================================================
+      # Resolve Visual Studio
+      # ============================================================
+
+      - name: Resolve Visual Studio
+        id: vs
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+
+          if (-not (Test-Path $vswhere)) {
+              Write-Error "vswhere.exe was not found."
+              exit 1
+          }
+
+          $vsPath = & $vswhere `
+              -latest `
+              -products * `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+              -property installationPath
+
+          $vsPath = $vsPath.Trim()
+
+          if (-not $vsPath) {
+              Write-Error "Visual Studio installation was not found."
+              exit 1
+          }
+
+          $vcvars = Join-Path `
+              $vsPath `
+              "VC\Auxiliary\Build\vcvarsall.bat"
+
+          if (-not (Test-Path $vcvars)) {
+              Write-Error "vcvarsall.bat was not found: $vcvars"
+              exit 1
+          }
+
+          Write-Host "Visual Studio:"
+          Write-Host $vsPath
+
+          Write-Host ""
+          Write-Host "vcvarsall:"
+          Write-Host $vcvars
+
+          "path=$vsPath" >> $env:GITHUB_OUTPUT
+
+
+      # ============================================================
+      # Ninja
+      # ============================================================
+
+      - name: Install Ninja
+        shell: pwsh
+        run: |
+          $ninja = Get-Command ninja `
+              -ErrorAction SilentlyContinue
+
+          if (-not $ninja) {
+              choco install ninja -y --no-progress
+          }
+
+          where.exe ninja
+          ninja --version
+
+
+      # ============================================================
+      # Restore build cache
+      #
+      # New cache key:
+      #
+      # CUDA 13.3
+      # sm86 only (sm89 GPU は sm86 cubin で動作)
+      # NVFP4 MMQ OFF
+      # ============================================================
+
+      - name: Restore build cache
+        id: build-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: build
+          key: beellama-4c007d272841-win2022-cuda133-sm86only-nvfp4off-mmqfix-faoff-v5
+          # 旧キャッシュ (sm86+sm89 v4 / sm75+sm89 v3) が残っていれば再利用する。
+          # CUDA arch 変更で nvcc のコマンドラインが変わるため、CUDA オブジェクトは
+          # Ninja が全て再コンパイルする。再利用できるのは C/C++ オブジェクトのみ。
+          restore-keys: |
+            beellama-4c007d272841-win2022-cuda133-sm86-sm89-nvfp4off-mmqfix-faoff-v4
+            beellama-4c007d272841-win2022-cuda133-sm75-sm89-nvfp4off-faoff-v3
+
+
+      - name: Show cache status
+        shell: pwsh
+        run: |
+          Write-Host "========================================="
+          Write-Host " Build cache"
+          Write-Host "========================================="
+
+          if ("${{ steps.build-cache.outputs.cache-hit }}" -eq "true") {
+              Write-Host "CACHE HIT"
+          }
+          elseif ("${{ steps.build-cache.outputs.cache-matched-key }}" -ne "") {
+              Write-Host "CACHE RESTORED FROM: ${{ steps.build-cache.outputs.cache-matched-key }}"
+          }
+          else {
+              Write-Host "CACHE MISS"
+          }
+
+
+      # ============================================================
+      # Normalize timestamps for cache reuse
+      #
+      # Ninja は mtime で再ビルド判定する。
+      # checkout 直後のソースと、ジョブ内でインストールした CUDA ヘッダは
+      # 復元したオブジェクトより新しくなるため、そのままでは全再ビルドになる。
+      #
+      # - 追跡ソースと CUDA include を固定の古い時刻にする
+      # - 修正前キャッシュと内容が異なる mmq.cu だけ現在時刻にして再コンパイルさせる
+      # - server-chat.cpp も念のため現在時刻 (llama-server 側のみで軽い)
+      # - mmq.cuh は修正前と同一ロジック・同一 commit で内容が同じため古い時刻のまま
+      #   (触ると MMQ テンプレートインスタンス全体が再コンパイルされる)
+      # ============================================================
+
+      - name: Normalize timestamps for cache reuse
+        if: steps.build-cache.outputs.cache-matched-key != ''
+        shell: pwsh
+        run: |
+          $old = [datetime]::new(2020, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
+          $now = [datetime]::UtcNow
+
+          $count = 0
+          foreach ($path in @(git ls-files --recurse-submodules)) {
+              if (Test-Path -LiteralPath $path -PathType Leaf) {
+                  (Get-Item -LiteralPath $path).LastWriteTimeUtc = $old
+                  $count++
+              }
+          }
+          Write-Host "Source files normalized: $count"
+
+          $cudaInclude = Join-Path $env:CUDA_PATH "include"
+          if (-not (Test-Path $cudaInclude)) {
+              Write-Error "CUDA include directory not found: $cudaInclude"
+              exit 1
+          }
+
+          $count = 0
+          Get-ChildItem $cudaInclude -Recurse -File | ForEach-Object {
+              $_.LastWriteTimeUtc = $old
+              $count++
+          }
+          Write-Host "CUDA headers normalized: $count"
+
+          foreach ($path in @(
+              "ggml/src/ggml-cuda/mmq.cu",
+              "tools/server/server-chat.cpp"
+          )) {
+              (Get-Item -LiteralPath $path).LastWriteTimeUtc = $now
+              Write-Host "Marked as changed: $path"
+          }
+
+
+      # ============================================================
+      # Configure
+      #
+      # RTX 3080 Ti       = sm86
+      # RTX 4070 Ti SUPER = sm89 (sm86 cubin で動作。CUDA は同一メジャー内で上位互換)
+      #
+      # sm75 / RTX 2080 Ti NOT included.
+      # ============================================================
+
+      - name: Configure BeeLlama
+        shell: cmd
+        run: |
+          set "VS_PATH=${{ steps.vs.outputs.path }}"
+
+          call "%VS_PATH%\VC\Auxiliary\Build\vcvarsall.bat" x64
+          if errorlevel 1 exit /b 1
+
+          echo =========================================
+          echo Compiler
+          echo =========================================
+
+          where cl
+          if errorlevel 1 exit /b 1
+
+          cl
+
+          echo =========================================
+          echo CUDA
+          echo =========================================
+
+          where nvcc
+          if errorlevel 1 exit /b 1
+
+          nvcc --version
+
+          echo =========================================
+          echo Ninja
+          echo =========================================
+
+          where ninja
+          if errorlevel 1 exit /b 1
+
+          ninja --version
+
+          echo =========================================
+          echo Configure
+          echo =========================================
+
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_CUDA=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CUDA_FA=ON ^
+            -DGGML_CUDA_FA_ALL_QUANTS=OFF ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DCMAKE_CUDA_ARCHITECTURES="86-real"
+
+          if errorlevel 1 exit /b 1
+
+
+      # ============================================================
+      # Verify CMake configuration
+      # ============================================================
+
+      - name: Verify CMake configuration
+        shell: pwsh
+        run: |
+          $cache = "build\CMakeCache.txt"
+
+          if (-not (Test-Path $cache)) {
+              Write-Error "CMakeCache.txt was not found."
+              exit 1
+          }
+
+          Write-Host "========================================="
+          Write-Host " CMake configuration"
+          Write-Host "========================================="
+
+          Select-String `
+              -Path $cache `
+              -Pattern "CMAKE_CUDA_ARCHITECTURES|GGML_CUDA_FA_ALL_QUANTS|GGML_CUDA_FA:|GGML_CUDA:"
+
+          $cuda = Select-String `
+              -Path $cache `
+              -Pattern "^GGML_CUDA:"
+
+          if (-not $cuda -or $cuda.Line -notmatch "=ON") {
+              Write-Error "GGML_CUDA is not ON."
+              exit 1
+          }
+
+          $fa = Select-String `
+              -Path $cache `
+              -Pattern "^GGML_CUDA_FA:"
+
+          if (-not $fa -or $fa.Line -notmatch "=ON") {
+              Write-Error "GGML_CUDA_FA is not ON."
+              exit 1
+          }
+
+          $allQuants = Select-String `
+              -Path $cache `
+              -Pattern "^GGML_CUDA_FA_ALL_QUANTS:"
+
+          if (-not $allQuants -or $allQuants.Line -notmatch "=OFF") {
+              Write-Error "GGML_CUDA_FA_ALL_QUANTS is not OFF."
+              exit 1
+          }
+
+          $arch = Select-String `
+              -Path $cache `
+              -Pattern "^CMAKE_CUDA_ARCHITECTURES"
+
+          if (-not $arch) {
+              Write-Error "CMAKE_CUDA_ARCHITECTURES was not found."
+              exit 1
+          }
+
+          Write-Host ""
+          Write-Host $arch.Line
+
+          if ($arch.Line -notmatch "=86-real$") {
+              Write-Error "Expected CUDA architectures 86-real only."
+              exit 1
+          }
+
+          Write-Host ""
+          Write-Host "CMake configuration OK."
+
+
+      # ============================================================
+      # Build llama-server only
+      # ============================================================
+
+      - name: Build llama-server
+        shell: cmd
+        run: |
+          set "VS_PATH=${{ steps.vs.outputs.path }}"
+
+          call "%VS_PATH%\VC\Auxiliary\Build\vcvarsall.bat" x64
+          if errorlevel 1 exit /b 1
+
+          echo =========================================
+          echo Build llama-server
+          echo =========================================
+
+          cmake --build build ^
+            --config Release ^
+            --target llama-server ^
+            --parallel
+
+          if errorlevel 1 exit /b 1
+
+
+      # ============================================================
+      # Save build cache immediately after successful build
+      #
+      # Before any runtime/version verification.
+      # ============================================================
+
+      - name: Save build cache
+        if: success() && steps.build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: build
+          key: beellama-4c007d272841-win2022-cuda133-sm86only-nvfp4off-mmqfix-faoff-v5
+
+
+      # ============================================================
+      # Show build output
+      # ============================================================
+
+      - name: Show build output
+        shell: pwsh
+        run: |
+          Write-Host "========================================="
+          Write-Host " Build output"
+          Write-Host "========================================="
+
+          Get-ChildItem `
+              build `
+              -Recurse `
+              -File |
+              Where-Object {
+                  $_.Name -eq "llama-server.exe" -or
+                  $_.Extension -eq ".dll"
+              } |
+              Select-Object FullName
+
+
+      # ============================================================
+      # Show binary version
+      #
+      # Diagnostic only.
+      # NEVER kill artifact generation.
+      # ============================================================
+
+      - name: Show binary version
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $server = Get-ChildItem `
+              build `
+              -Recurse `
+              -Filter "llama-server.exe" `
+              -File |
+              Select-Object -First 1
+
+          if (-not $server) {
+              Write-Warning "llama-server.exe was not found."
+              exit 0
+          }
+
+          Write-Host "========================================="
+          Write-Host " Binary version"
+          Write-Host "========================================="
+
+          $out = (& $server.FullName --version 2>&1 | Out-String)
+
+          Write-Host $out
+
+          if ($out -notmatch '0\.4\.7') {
+              Write-Warning "Binary does not report version 0.4.7."
+              Write-Warning "Artifact creation will continue."
+          }
+
+          if ($out -notmatch '4c007d2') {
+              Write-Warning "Binary does not report commit 4c007d2."
+              Write-Warning "Artifact creation will continue."
+          }
+
+
+      # ============================================================
+      # Verify -ubd
+      #
+      # Diagnostic only.
+      # Artifact creation continues on failure.
+      # ============================================================
+
+      - name: Verify draft ubatch option
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $server = Get-ChildItem `
+              build `
+              -Recurse `
+              -Filter "llama-server.exe" `
+              -File |
+              Select-Object -First 1
+
+          if (-not $server) {
+              Write-Error "llama-server.exe was not found."
+              exit 1
+          }
+
+          $helpOutput = (& $server.FullName --help 2>&1 | Out-String)
+
+          Write-Host "========================================="
+          Write-Host " Draft ubatch"
+          Write-Host "========================================="
+
+          $helpOutput -split "`r?`n" |
+              Select-String `
+                  -Pattern "spec-draft-ubatch-size|-ubd" |
+              ForEach-Object {
+                  Write-Host $_.Line
+              }
+
+          if ($helpOutput -notmatch "spec-draft-ubatch-size") {
+              Write-Error "--spec-draft-ubatch-size / -ubd was NOT found."
+              exit 1
+          }
+
+          Write-Host ""
+          Write-Host "OK: -ubd is available."
+
+
+      # ============================================================
+      # Create package
+      #
+      # Runs even if version / -ubd diagnostics fail.
+      # ============================================================
+
+      - name: Create package
+        if: always()
+        shell: pwsh
+        run: |
+          $package = "package"
+
+          Remove-Item `
+              $package `
+              -Recurse `
+              -Force `
+              -ErrorAction SilentlyContinue
+
+          New-Item `
+              -ItemType Directory `
+              -Path $package `
+              -Force |
+              Out-Null
+
+
+          $server = Get-ChildItem `
+              build `
+              -Recurse `
+              -Filter "llama-server.exe" `
+              -File `
+              -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+
+          if (-not $server) {
+              Write-Warning "llama-server.exe was not found."
+              exit 0
+          }
+
+          $bin = $server.Directory.FullName
+
+          Write-Host "Binary directory:"
+          Write-Host $bin
+
+
+          # --------------------------------------------------------
+          # EXE
+          # --------------------------------------------------------
+
+          Copy-Item `
+              $server.FullName `
+              -Destination $package `
+              -Force
+
+
+          # --------------------------------------------------------
+          # DLLs
+          # --------------------------------------------------------
+
+          Get-ChildItem `
+              $bin `
+              -Filter "*.dll" `
+              -File `
+              -ErrorAction SilentlyContinue |
+              Copy-Item `
+                  -Destination $package `
+                  -Force
+
+
+          # --------------------------------------------------------
+          # Source information
+          # --------------------------------------------------------
+
+          git rev-parse HEAD |
+              Out-File `
+                  "$package\source-commit.txt" `
+                  -Encoding ascii
+
+          git describe --tags --always |
+              Out-File `
+                  "$package\source-version.txt" `
+                  -Encoding ascii
+
+
+          # --------------------------------------------------------
+          # Complete patch
+          #
+          # Includes:
+          #
+          # Codex patch
+          # NVFP4 .cu deletion
+          # NVFP4 declaration removal
+          # NVFP4 dispatch removal
+          # --------------------------------------------------------
+
+          git diff |
+              Out-File `
+                  "$package\build-patches.patch" `
+                  -Encoding utf8
+
+
+          # --------------------------------------------------------
+          # Binary version
+          # --------------------------------------------------------
+
+          (& $server.FullName --version 2>&1 | Out-String) |
+              Out-File `
+                  "$package\llama-server-version.txt" `
+                  -Encoding utf8
+
+
+          # --------------------------------------------------------
+          # Draft options
+          # --------------------------------------------------------
+
+          $helpOutput = (& $server.FullName --help 2>&1 | Out-String)
+
+          $helpOutput -split "`r?`n" |
+              Select-String `
+                  -Pattern "spec-draft|draft-device|draft-ngl|ubd" |
+              ForEach-Object {
+                  $_.Line
+              } |
+              Out-File `
+                  "$package\draft-options.txt" `
+                  -Encoding utf8
+
+
+          # --------------------------------------------------------
+          # CUDA version
+          # --------------------------------------------------------
+
+          (& nvcc --version 2>&1 | Out-String) |
+              Out-File `
+                  "$package\cuda-version.txt" `
+                  -Encoding utf8
+
+
+          # --------------------------------------------------------
+          # Visual Studio
+          # --------------------------------------------------------
+
+          @"
+          ${{ steps.vs.outputs.path }}
+          "@ |
+              Out-File `
+                  "$package\visual-studio-path.txt" `
+                  -Encoding utf8
+
+
+          # --------------------------------------------------------
+          # Build information
+          # --------------------------------------------------------
+
+          @"
+          BeeLlama v0.4.7 Preview pinned build
+          =====================================
+
+          Source:
+          Anbeeld/beellama.cpp
+
+          Commit:
+          4c007d272841
+
+          CUDA:
+          13.3
+
+          CUDA architectures:
+
+          86-real
+          RTX 3080 Ti
+          RTX 4070 Ti SUPER (sm89, sm86 cubin で動作)
+
+          sm75 / RTX 2080 Ti:
+          NOT INCLUDED
+
+          Build target:
+          llama-server only
+
+          NVFP4 MMQ:
+          DISABLED
+
+          Removed:
+          ggml/src/ggml-cuda/template-instances/mmq-instance-nvfp4.cu
+
+          Removed declaration:
+          DECL_MMQ_CASE(GGML_TYPE_NVFP4)
+
+          Removed dispatcher:
+          case GGML_TYPE_NVFP4 (ggml_cuda_mul_mat_q_switch_type block + ggml_cuda_should_use_mmq label only; MMQ kept for other types)
+
+          Build options:
+
+          GGML_CUDA=ON
+          GGML_NATIVE=OFF
+          GGML_CUDA_FA=ON
+          GGML_CUDA_FA_ALL_QUANTS=OFF
+          LLAMA_BUILD_TESTS=OFF
+
+          CMAKE_CUDA_ARCHITECTURES=86-real
+
+          Required BeeLlama option:
+
+          --spec-draft-ubatch-size
+          -ubd
+
+          Codex Responses API compatibility:
+
+          raw string
+          input_text
+          output_text
+          text
+          input_image
+          "@ |
+              Out-File `
+                  "$package\BUILD-INFO.txt" `
+                  -Encoding utf8
+
+
+          Write-Host "========================================="
+          Write-Host " Package contents"
+          Write-Host "========================================="
+
+          Get-ChildItem `
+              $package `
+              -File |
+              Sort-Object Name |
+              Select-Object Name, Length
+
+
+      # ============================================================
+      # Create ZIP
+      # ============================================================
+
+      - name: Create ZIP
+        if: always()
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "package\llama-server.exe")) {
+              Write-Warning "No llama-server.exe to package."
+              exit 0
+          }
+
+          $zip = "beellama-preview-v0.4.7-4c007d272841-ubd-codex-cuda13.3-sm86only-no-nvfp4-mmqfix.zip"
+
+          Remove-Item `
+              $zip `
+              -Force `
+              -ErrorAction SilentlyContinue
+
+          Compress-Archive `
+              -Path package\* `
+              -DestinationPath $zip `
+              -Force
+
+          Write-Host "========================================="
+          Write-Host " ZIP"
+          Write-Host "========================================="
+
+          Get-Item $zip |
+              Select-Object `
+                  Name,
+                  @{N="MiB";E={[math]::Round($_.Length / 1MB, 2)}}
+
+
+      # ============================================================
+      # Upload ZIP artifact
+      #
+      # Runs even if diagnostics failed.
+      # ============================================================
+
+      - name: Upload ZIP artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: beellama-preview-v0.4.7-4c007d272841-ubd-codex-cuda13.3-sm86only-no-nvfp4-mmqfix
+          path: beellama-preview-v0.4.7-4c007d272841-ubd-codex-cuda13.3-sm86only-no-nvfp4-mmqfix.zip
+          if-no-files-found: warn
+          retention-days: 14
+
+
+      # ============================================================
+      # Emergency raw artifact
+      #
+      # If ZIP/package logic fails after successful compilation,
+      # preserve EXE + DLLs directly.
+      # ============================================================
+
+      - name: Upload raw build output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: beellama-raw-build-4c007d272841-cuda13.3-sm86only-no-nvfp4-mmqfix
+          path: |
+            build/bin/Release/llama-server.exe
+            build/bin/Release/*.dll
+            build/bin/llama-server.exe
+            build/bin/*.dll
+          if-no-files-found: warn
+          retention-days: 14
