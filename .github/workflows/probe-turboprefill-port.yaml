@@ -1,0 +1,89 @@
+name: Probe TurboPrefill port to BeeLlama 4c007d272841 (patch feasibility only)
+
+# CUDAビルドは行わない。TurboPrefill差分を抽出し、BeeLlama固定コミットへ
+# 3-wayで当たるかだけを数分で判定する。結果は artifact に保存する。
+
+on:
+  workflow_dispatch:
+    inputs:
+      tp_repo:
+        description: "TurboPrefill fork (owner/name)"
+        default: "sergey-automation/llama.cpp"
+      tp_branch:
+        description: "TurboPrefill branch"
+        default: "turboprefill-rfc-poc"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout BeeLlama pinned commit
+        run: |
+          git clone https://github.com/Anbeeld/beellama.cpp.git bee
+          cd bee
+          git checkout 4c007d272841
+          git log -1 --oneline
+
+      - name: Fetch TurboPrefill and upstream
+        run: |
+          git clone --filter=blob:none --no-checkout \
+            -b "${{ inputs.tp_branch }}" \
+            "https://github.com/${{ inputs.tp_repo }}.git" tp
+          cd tp
+          git remote add upstream https://github.com/ggml-org/llama.cpp.git
+          git fetch --filter=blob:none upstream master
+          git log -1 --oneline
+          BASE=$(git merge-base HEAD upstream/master)
+          echo "merge-base with upstream master: $BASE"
+          echo "$BASE" > ../tp-base.txt
+
+      - name: List files changed by TurboPrefill
+        run: |
+          cd tp
+          BASE=$(cat ../tp-base.txt)
+          git diff --stat "$BASE"..HEAD | tee ../tp-stat.txt
+          git diff --name-status "$BASE"..HEAD | tee ../tp-files.txt
+
+      - name: Extract patch (core files only)
+        run: |
+          cd tp
+          BASE=$(cat ../tp-base.txt)
+          git diff "$BASE"..HEAD -- \
+            src/llama-context.cpp src/llama-context.h \
+            ggml/src/ggml-backend.cpp ggml/include/ggml-backend.h \
+            ggml/src/ggml-backend-impl.h > ../turboprefill-core.patch
+          wc -l ../turboprefill-core.patch
+
+      - name: Try 3-way apply onto BeeLlama
+        continue-on-error: true
+        run: |
+          cd bee
+          git config user.email probe@example.invalid
+          git config user.name probe
+          git apply --3way --verbose ../turboprefill-core.patch 2>&1 | tee ../apply-result.txt
+          echo "exit=${PIPESTATUS[0]}" | tee -a ../apply-result.txt
+          echo "--- conflict markers ---" | tee -a ../apply-result.txt
+          grep -rln '^<<<<<<<' src ggml 2>/dev/null | tee -a ../apply-result.txt || true
+
+      - name: Check BeeLlama-specific features still present
+        run: |
+          cd bee
+          for k in dflash kvarn tcq turbo; do
+            echo "== $k =="
+            grep -rli "$k" src/llama-context.cpp ggml/src/ggml-backend.cpp || echo "(none)"
+          done | tee ../bee-features.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: turboprefill-probe
+          path: |
+            tp-base.txt
+            tp-stat.txt
+            tp-files.txt
+            turboprefill-core.patch
+            apply-result.txt
+            bee-features.txt
+          retention-days: 14
