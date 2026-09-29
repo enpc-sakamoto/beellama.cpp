@@ -34,9 +34,10 @@ jobs:
           cd tp
           git remote add upstream https://github.com/ggml-org/llama.cpp.git
           git fetch --filter=blob:none upstream master
+          git fetch --filter=blob:none upstream tag b10451 --no-tags
           git log -1 --oneline
-          BASE=$(git merge-base HEAD upstream/master)
-          echo "merge-base with upstream master: $BASE"
+          BASE=$(git rev-parse b10451^{commit})
+          echo "upstream tag b10451: $BASE (merge-base master: $(git merge-base HEAD upstream/master))"
           echo "$BASE" > ../tp-base.txt
 
       - name: List files changed by TurboPrefill
