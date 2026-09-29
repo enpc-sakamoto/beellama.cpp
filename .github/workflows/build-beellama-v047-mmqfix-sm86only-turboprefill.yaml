@@ -1,0 +1,1653 @@
+name: Build BeeLlama v0.4.7 Preview ubd Codex CUDA13.3 sm86only no-NVFP4 mmqfix TurboPrefill
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+
+      # ============================================================
+      # Checkout BeeLlama pinned commit
+      # ============================================================
+
+      - name: Checkout BeeLlama repository
+        uses: actions/checkout@v4
+        with:
+          repository: Anbeeld/beellama.cpp
+          fetch-depth: 0
+          submodules: recursive
+
+
+      # ============================================================
+      # Checkout and verify pinned preview commit
+      # ============================================================
+
+      - name: Checkout pinned preview commit
+        id: source
+        shell: pwsh
+        run: |
+          $expected = "4c007d272841"
+
+          git fetch --all --tags --force
+          git checkout $expected
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "Unable to checkout BeeLlama commit $expected."
+              exit 1
+          }
+
+          git submodule sync --recursive
+          git submodule update --init --recursive
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "Submodule update failed."
+              exit 1
+          }
+
+          $actual = (git rev-parse --short=12 HEAD).Trim()
+          $actualFull = (git rev-parse HEAD).Trim()
+
+          Write-Host "========================================="
+          Write-Host " BeeLlama source"
+          Write-Host "========================================="
+
+          Write-Host "Expected: $expected"
+          Write-Host "Actual:   $actual"
+          Write-Host "Full:     $actualFull"
+
+          if ($actual -ne $expected) {
+              Write-Error "Unexpected BeeLlama commit."
+              exit 1
+          }
+
+          git describe --tags --always
+          git log -1 --oneline
+
+          "commit=$actualFull" >> $env:GITHUB_OUTPUT
+
+
+      # ============================================================
+      # Verify Codex patch target
+      # ============================================================
+
+      - name: Verify Codex patch target
+        shell: pwsh
+        run: |
+          $path = "tools/server/server-chat.cpp"
+
+          if (-not (Test-Path $path)) {
+              Write-Error "File not found: $path"
+              exit 1
+          }
+
+          $content = Get-Content $path -Raw
+
+          Write-Host "========================================="
+          Write-Host " Codex patch target"
+          Write-Host "========================================="
+
+          Select-String `
+              -Path $path `
+              -Pattern "Output of tool call|input_text|chatcmpl_output" `
+              -Context 10,10
+
+          if (-not $content.Contains("Output of tool call should be 'Input text'")) {
+              Write-Error "Expected Codex patch target was not found."
+              exit 1
+          }
+
+          Write-Host "Codex patch target OK."
+
+
+      # ============================================================
+      # Codex Responses API compatibility patch
+      # ============================================================
+
+      - name: Patch Codex tool output compatibility
+        shell: pwsh
+        run: |
+          $path = "tools/server/server-chat.cpp"
+          $content = Get-Content $path -Raw
+
+          $pattern = 'if\s*\(\s*!chatcmpl_output\.contains\("type"\)\s*\|\|\s*chatcmpl_output\.at\("type"\)\s*!=\s*"input_text"\s*\)\s*\{\s*throw\s+std::invalid_argument\("Output of tool call should be ''Input text''"\);\s*\}\s*chatcmpl_output\["type"\]\s*=\s*"text"\s*;'
+
+          $replacement = @'
+          SRV_WRN("Codex function_call_output item: %s\n",
+                  chatcmpl_output.dump().c_str());
+
+          if (chatcmpl_output.is_string()) {
+              chatcmpl_output = {
+                  {"type", "text"},
+                  {"text", chatcmpl_output.get<std::string>()}
+              };
+
+          } else if (chatcmpl_output.is_object()) {
+              const std::string type =
+                  json_value(chatcmpl_output, "type", std::string());
+
+              if (type == "input_text" ||
+                  type == "output_text" ||
+                  type == "text") {
+
+                  if (!chatcmpl_output.contains("text") ||
+                      !chatcmpl_output.at("text").is_string()) {
+                      throw std::invalid_argument(
+                          "Tool output text block requires 'text'");
+                  }
+
+                  chatcmpl_output["type"] = "text";
+
+              } else if (type == "input_image") {
+
+                  if (!chatcmpl_output.contains("image_url") ||
+                      !chatcmpl_output.at("image_url").is_string()) {
+                      throw std::invalid_argument(
+                          "Tool output image block requires string 'image_url'");
+                  }
+
+                  const std::string url =
+                      chatcmpl_output.at("image_url").get<std::string>();
+
+                  chatcmpl_output = {
+                      {"type", "image_url"},
+                      {"image_url", {
+                          {"url", url}
+                      }}
+                  };
+
+              } else {
+                  throw std::invalid_argument(
+                      "Unsupported tool output content type: " + type);
+              }
+
+          } else {
+              throw std::invalid_argument(
+                  "Unsupported tool output content");
+          }
+          '@
+
+          $patched = [regex]::Replace(
+              $content,
+              $pattern,
+              $replacement,
+              [System.Text.RegularExpressions.RegexOptions]::Singleline
+          )
+
+          if ($patched -eq $content) {
+              Write-Host ""
+              Write-Host "Patch target was not replaced."
+
+              Select-String `
+                  -Path $path `
+                  -Pattern "Output of tool call|chatcmpl_output" `
+                  -Context 20,20
+
+              Write-Error "Codex compatibility patch failed."
+              exit 1
+          }
+
+          Set-Content `
+              -Path $path `
+              -Value $patched `
+              -NoNewline `
+              -Encoding UTF8
+
+          Write-Host "========================================="
+          Write-Host " Codex patch applied"
+          Write-Host "========================================="
+
+          git diff -- $path
+
+
+      # ============================================================
+      # Verify Codex patch
+      # ============================================================
+
+      - name: Verify Codex patch
+        shell: pwsh
+        run: |
+          $path = "tools/server/server-chat.cpp"
+          $content = Get-Content $path -Raw
+
+          $required = @(
+              "Codex function_call_output item",
+              'type == "input_image"',
+              'type == "output_text"',
+              '{"type", "image_url"}'
+          )
+
+          foreach ($item in $required) {
+              if (-not $content.Contains($item)) {
+                  Write-Error "Codex patch verification failed: $item"
+                  exit 1
+              }
+          }
+
+          Write-Host "Codex compatibility patch verification OK."
+
+
+      # ============================================================
+      # TurboPrefill port (2026.9.29 ENPC)
+      #
+      # sergey-automation/llama.cpp turboprefill-rfc-poc (b10451, v2.1.3) の
+      # 差分を BeeLlama 4c007d272841 へ手動統合したパッチ (gzip+base64)。
+      # 対象: ggml-backend.{h,cpp} / llama-context.{h,cpp} / server-context.cpp
+      # 既定は無効。環境変数 TURBOPREFILL=1 のときだけ有効化される。
+      # ============================================================
+
+      - name: Apply TurboPrefill port patch
+        shell: pwsh
+        run: |
+          $b64 = @'
+          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
+          '@
+          $bytes = [Convert]::FromBase64String(($b64 -replace '\s', ''))
+          $ms = New-Object System.IO.MemoryStream(,$bytes)
+          $gz = New-Object System.IO.Compression.GZipStream($ms, [System.IO.Compression.CompressionMode]::Decompress)
+          $out = New-Object System.IO.MemoryStream
+          $gz.CopyTo($out)
+          [System.IO.File]::WriteAllBytes("$PWD\turboprefill-bee.patch", $out.ToArray())
+
+          git apply --check --whitespace=nowarn turboprefill-bee.patch
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "TurboPrefill patch does not apply."
+              exit 1
+          }
+          git apply --whitespace=nowarn turboprefill-bee.patch
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "TurboPrefill patch apply failed."
+              exit 1
+          }
+          Remove-Item turboprefill-bee.patch -Force
+
+          $content = Get-Content "ggml/src/ggml-backend.cpp" -Raw
+          if (-not $content.Contains("ggml_backend_sched_graph_compute_async_turboprefill")) {
+              Write-Error "TurboPrefill verification failed."
+              exit 1
+          }
+          git diff --stat
+          Write-Host "TurboPrefill patch applied."
+
+
+      # ============================================================
+      # Show NVFP4 references before patch
+      # ============================================================
+
+      - name: Show NVFP4 references before patch
+        shell: pwsh
+        run: |
+          Write-Host "========================================="
+          Write-Host " NVFP4 references before patch"
+          Write-Host "========================================="
+
+          Get-ChildItem `
+              "ggml/src/ggml-cuda" `
+              -Recurse `
+              -File |
+              Select-String `
+                  -Pattern "GGML_TYPE_NVFP4|mmq-instance-nvfp4" `
+                  -ErrorAction SilentlyContinue |
+              Select-Object Path, LineNumber, Line
+
+
+      # ============================================================
+      # Disable NVFP4 MMQ
+      #
+      # Remove:
+      #
+      #   mmq-instance-nvfp4.cu
+      #
+      #   extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
+      #
+      #   case GGML_TYPE_NVFP4:
+      #       ...
+      #       break;
+      #
+      # ============================================================
+
+      - name: Disable NVFP4 MMQ
+        shell: pwsh
+        run: |
+          $nvfp4 = "ggml/src/ggml-cuda/template-instances/mmq-instance-nvfp4.cu"
+          $cuh   = "ggml/src/ggml-cuda/mmq.cuh"
+          $cu    = "ggml/src/ggml-cuda/mmq.cu"
+
+          Write-Host "========================================="
+          Write-Host " Disable NVFP4 MMQ"
+          Write-Host "========================================="
+
+
+          # --------------------------------------------------------
+          # Verify required files
+          # --------------------------------------------------------
+
+          foreach ($file in @($nvfp4, $cuh, $cu)) {
+              if (-not (Test-Path $file)) {
+                  Write-Error "Required file not found: $file"
+                  exit 1
+              }
+          }
+
+
+          # --------------------------------------------------------
+          # Remove CUDA template instance source
+          # --------------------------------------------------------
+
+          Write-Host ""
+          Write-Host "Removing CUDA source:"
+          Write-Host $nvfp4
+
+          Remove-Item `
+              $nvfp4 `
+              -Force
+
+          if (Test-Path $nvfp4) {
+              Write-Error "Failed to remove NVFP4 CUDA source."
+              exit 1
+          }
+
+
+          # --------------------------------------------------------
+          # Remove extern declaration from mmq.cuh
+          # --------------------------------------------------------
+
+          Write-Host ""
+          Write-Host "NVFP4 references in mmq.cuh before patch:"
+
+          Select-String `
+              -Path $cuh `
+              -Pattern "NVFP4" `
+              -Context 2,2
+
+          $lines = @(Get-Content $cuh)
+
+          $filtered = @(
+              $lines | Where-Object {
+                  $_ -notmatch 'DECL_MMQ_CASE\s*\(\s*GGML_TYPE_NVFP4\s*\)'
+              }
+          )
+
+          if ($filtered.Count -eq $lines.Count) {
+              Write-Error "NVFP4 declaration was not found in mmq.cuh."
+              exit 1
+          }
+
+          $filtered |
+              Set-Content `
+                  -Path $cuh `
+                  -Encoding UTF8
+
+
+          # --------------------------------------------------------
+          # Show dispatcher before removal
+          # --------------------------------------------------------
+
+          Write-Host ""
+          Write-Host "NVFP4 references in mmq.cu before patch:"
+
+          Select-String `
+              -Path $cu `
+              -Pattern "GGML_TYPE_NVFP4" `
+              -Context 4,4
+
+
+          # --------------------------------------------------------
+          # Remove NVFP4 case labels
+          #
+          # mmq.cu has two kinds of NVFP4 case:
+          #
+          # 1. Own block (ggml_cuda_mul_mat_q_switch_type):
+          #
+          #      case GGML_TYPE_NVFP4:
+          #          mul_mat_q_case<GGML_TYPE_NVFP4>(...);
+          #          break;
+          #
+          #    -> remove case .. break.
+          #
+          # 2. Fall-through group member (ggml_cuda_should_use_mmq):
+          #
+          #      case GGML_TYPE_MXFP4:
+          #      case GGML_TYPE_NVFP4:
+          #          mmq_supported = true;
+          #          break;
+          #
+          #    -> remove ONLY the case label.
+          #       The shared body is used by all other quant types.
+          #       Removing it disables MMQ for every type
+          #       (IQ3_XXS etc. fall back to cuBLAS).
+          #
+          # Rule: if the previous kept code line is a case label,
+          #       the NVFP4 case is a fall-through group member.
+          # --------------------------------------------------------
+
+          $lines = @(Get-Content $cu)
+
+          $result = New-Object System.Collections.Generic.List[string]
+
+          $insideNvfp4Case = $false
+          $removedBlocks = 0
+          $removedLabels = 0
+
+          foreach ($line in $lines) {
+
+              if (-not $insideNvfp4Case) {
+
+                  if ($line -match '^\s*case\s+GGML_TYPE_NVFP4\s*:\s*$') {
+
+                      # Find previous non-empty, non-comment line.
+                      $prev = ""
+                      for ($i = $result.Count - 1; $i -ge 0; $i--) {
+                          $t = $result[$i].Trim()
+                          if ($t -ne "" -and -not $t.StartsWith("//")) {
+                              $prev = $t
+                              break
+                          }
+                      }
+
+                      Write-Host ""
+
+                      if ($prev -match '^case\s+\w+\s*:$') {
+                          $removedLabels++
+                          Write-Host "Removing NVFP4 fall-through label only:"
+                          Write-Host "  REMOVE: $line"
+                          continue
+                      }
+
+                      $insideNvfp4Case = $true
+                      Write-Host "Removing NVFP4 case block starting at:"
+                      Write-Host "  REMOVE: $line"
+                      continue
+                  }
+
+                  $result.Add($line)
+                  continue
+              }
+
+
+              # We are inside NVFP4 own case block.
+
+              Write-Host "  REMOVE: $line"
+
+              if ($line -match '^\s*case\s+\w+\s*:' -or $line -match '^\s*default\s*:') {
+                  Write-Error "NVFP4 case block reached another label before break."
+                  exit 1
+              }
+
+              if ($line -match '^\s*break\s*;\s*$') {
+                  $removedBlocks++
+                  $insideNvfp4Case = $false
+              }
+          }
+
+
+          if ($insideNvfp4Case) {
+              Write-Error "NVFP4 dispatcher block did not terminate."
+              exit 1
+          }
+
+          if ($removedBlocks -ne 1) {
+              Write-Error "Expected 1 NVFP4 dispatcher block, removed $removedBlocks."
+              exit 1
+          }
+
+          if ($removedLabels -ne 1) {
+              Write-Error "Expected 1 NVFP4 fall-through label, removed $removedLabels."
+              exit 1
+          }
+
+
+          $result |
+              Set-Content `
+                  -Path $cu `
+                  -Encoding UTF8
+
+
+          # --------------------------------------------------------
+          # Display remaining references
+          # --------------------------------------------------------
+
+          Write-Host ""
+          Write-Host "========================================="
+          Write-Host " Remaining NVFP4 references"
+          Write-Host "========================================="
+
+          Write-Host ""
+          Write-Host "mmq.cuh:"
+
+          Select-String `
+              -Path $cuh `
+              -Pattern "GGML_TYPE_NVFP4" `
+              -Context 2,2 `
+              -ErrorAction SilentlyContinue
+
+          Write-Host ""
+          Write-Host "mmq.cu:"
+
+          Select-String `
+              -Path $cu `
+              -Pattern "GGML_TYPE_NVFP4" `
+              -Context 2,2 `
+              -ErrorAction SilentlyContinue
+
+
+          Write-Host ""
+          Write-Host "========================================="
+          Write-Host " Patch diff"
+          Write-Host "========================================="
+
+          git diff -- `
+              ggml/src/ggml-cuda/mmq.cuh `
+              ggml/src/ggml-cuda/mmq.cu `
+              ggml/src/ggml-cuda/template-instances/mmq-instance-nvfp4.cu
+
+
+      # ============================================================
+      # Verify NVFP4 MMQ exclusion
+      #
+      # Other NVFP4 references may remain.
+      #
+      # We only require:
+      #
+      #   instance .cu absent
+      #   DECL_MMQ_CASE absent
+      #   case GGML_TYPE_NVFP4 absent
+      #
+      # ============================================================
+
+      - name: Verify NVFP4 MMQ exclusion
+        shell: pwsh
+        run: |
+          $nvfp4 = "ggml/src/ggml-cuda/template-instances/mmq-instance-nvfp4.cu"
+          $cuh   = "ggml/src/ggml-cuda/mmq.cuh"
+          $cu    = "ggml/src/ggml-cuda/mmq.cu"
+
+          Write-Host "========================================="
+          Write-Host " Verify NVFP4 MMQ exclusion"
+          Write-Host "========================================="
+
+
+          if (Test-Path $nvfp4) {
+              Write-Error "NVFP4 CUDA source still exists."
+              exit 1
+          }
+
+
+          $cuhContent = Get-Content $cuh -Raw
+
+          if ($cuhContent -match 'DECL_MMQ_CASE\s*\(\s*GGML_TYPE_NVFP4\s*\)') {
+
+              Select-String `
+                  -Path $cuh `
+                  -Pattern "NVFP4" `
+                  -Context 3,3
+
+              Write-Error "NVFP4 declaration still exists in mmq.cuh."
+              exit 1
+          }
+
+
+          $cuContent = Get-Content $cu -Raw
+
+          if ($cuContent -match 'case\s+GGML_TYPE_NVFP4\s*:') {
+
+              Write-Host ""
+              Write-Host "Remaining dispatcher:"
+
+              Select-String `
+                  -Path $cu `
+                  -Pattern "case\s+GGML_TYPE_NVFP4" `
+                  -Context 5,10
+
+              Write-Error "NVFP4 dispatcher still exists in mmq.cu."
+              exit 1
+          }
+
+
+          # MMQ support switch must still enable MMQ for other types.
+          # (Broken patch removed the shared "mmq_supported = true; break;")
+
+          if ($cuContent -notmatch 'case\s+GGML_TYPE_MXFP4\s*:\s*\r?\n\s*mmq_supported\s*=\s*true\s*;\s*\r?\n\s*break\s*;') {
+
+              Select-String `
+                  -Path $cu `
+                  -Pattern "mmq_supported" `
+                  -Context 5,5
+
+              Write-Error "ggml_cuda_should_use_mmq: shared 'mmq_supported = true; break;' is broken."
+              exit 1
+          }
+
+          if ($cuContent -notmatch 'case\s+GGML_TYPE_MXFP4\s*:\s*\r?\n\s*mul_mat_q_case<GGML_TYPE_MXFP4>\(ctx,\s*args,\s*stream\)\s*;\s*\r?\n\s*break\s*;') {
+              Write-Error "ggml_cuda_mul_mat_q_switch_type: MXFP4 dispatcher is broken."
+              exit 1
+          }
+
+          Write-Host "MMQ support switch OK (other quant types keep MMQ)."
+
+
+          Write-Host ""
+          Write-Host "NVFP4 MMQ exclusion OK."
+
+
+      # ============================================================
+      # CUDA 13.3
+      # ============================================================
+
+      - name: Install CUDA Toolkit 13.3
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '13.3'
+          cuda_arch: 'x64'
+
+
+      # ============================================================
+      # Verify CUDA
+      # ============================================================
+
+      - name: Verify CUDA
+        shell: pwsh
+        run: |
+          Write-Host "========================================="
+          Write-Host " CUDA"
+          Write-Host "========================================="
+
+          Write-Host "CUDA_PATH=$env:CUDA_PATH"
+
+          $nvcc = Get-Command nvcc `
+              -ErrorAction SilentlyContinue
+
+          if (-not $nvcc) {
+              Write-Error "nvcc was not found."
+              exit 1
+          }
+
+          Write-Host ""
+          Write-Host "nvcc:"
+          Write-Host $nvcc.Source
+
+          $version = (& nvcc --version 2>&1 | Out-String)
+
+          Write-Host ""
+          Write-Host $version
+
+          if ($version -notmatch 'release 13\.3') {
+              Write-Error "CUDA 13.3 is required."
+              exit 1
+          }
+
+          Write-Host "CUDA 13.3 OK."
+
+
+      # ============================================================
+      # Resolve Visual Studio
+      # ============================================================
+
+      - name: Resolve Visual Studio
+        id: vs
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+
+          if (-not (Test-Path $vswhere)) {
+              Write-Error "vswhere.exe was not found."
+              exit 1
+          }
+
+          $vsPath = & $vswhere `
+              -latest `
+              -products * `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+              -property installationPath
+
+          $vsPath = $vsPath.Trim()
+
+          if (-not $vsPath) {
+              Write-Error "Visual Studio installation was not found."
+              exit 1
+          }
+
+          $vcvars = Join-Path `
+              $vsPath `
+              "VC\Auxiliary\Build\vcvarsall.bat"
+
+          if (-not (Test-Path $vcvars)) {
+              Write-Error "vcvarsall.bat was not found: $vcvars"
+              exit 1
+          }
+
+          Write-Host "Visual Studio:"
+          Write-Host $vsPath
+
+          Write-Host ""
+          Write-Host "vcvarsall:"
+          Write-Host $vcvars
+
+          "path=$vsPath" >> $env:GITHUB_OUTPUT
+
+
+      # ============================================================
+      # Ninja
+      # ============================================================
+
+      - name: Install Ninja
+        shell: pwsh
+        run: |
+          $ninja = Get-Command ninja `
+              -ErrorAction SilentlyContinue
+
+          if (-not $ninja) {
+              choco install ninja -y --no-progress
+          }
+
+          where.exe ninja
+          ninja --version
+
+
+      # ============================================================
+      # Restore build cache
+      #
+      # New cache key:
+      #
+      # CUDA 13.3
+      # sm86 only (sm89 GPU は sm86 cubin で動作)
+      # NVFP4 MMQ OFF
+      # ============================================================
+
+      - name: Restore build cache
+        id: build-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: build
+          key: beellama-4c007d272841-win2022-cuda133-sm86only-nvfp4off-mmqfix-faoff-tp-v1
+          # 旧キャッシュ (sm86+sm89 v4 / sm75+sm89 v3) が残っていれば再利用する。
+          # CUDA arch 変更で nvcc のコマンドラインが変わるため、CUDA オブジェクトは
+          # Ninja が全て再コンパイルする。再利用できるのは C/C++ オブジェクトのみ。
+          restore-keys: |
+            beellama-4c007d272841-win2022-cuda133-sm86only-nvfp4off-mmqfix-faoff-v5
+            beellama-4c007d272841-win2022-cuda133-sm86-sm89-nvfp4off-mmqfix-faoff-v4
+            beellama-4c007d272841-win2022-cuda133-sm75-sm89-nvfp4off-faoff-v3
+
+
+      - name: Show cache status
+        shell: pwsh
+        run: |
+          Write-Host "========================================="
+          Write-Host " Build cache"
+          Write-Host "========================================="
+
+          if ("${{ steps.build-cache.outputs.cache-hit }}" -eq "true") {
+              Write-Host "CACHE HIT"
+          }
+          elseif ("${{ steps.build-cache.outputs.cache-matched-key }}" -ne "") {
+              Write-Host "CACHE RESTORED FROM: ${{ steps.build-cache.outputs.cache-matched-key }}"
+          }
+          else {
+              Write-Host "CACHE MISS"
+          }
+
+
+      # ============================================================
+      # Normalize timestamps for cache reuse
+      #
+      # Ninja は mtime で再ビルド判定する。
+      # checkout 直後のソースと、ジョブ内でインストールした CUDA ヘッダは
+      # 復元したオブジェクトより新しくなるため、そのままでは全再ビルドになる。
+      #
+      # - 追跡ソースと CUDA include を固定の古い時刻にする
+      # - 修正前キャッシュと内容が異なる mmq.cu だけ現在時刻にして再コンパイルさせる
+      # - server-chat.cpp も念のため現在時刻 (llama-server 側のみで軽い)
+      # - mmq.cuh は修正前と同一ロジック・同一 commit で内容が同じため古い時刻のまま
+      #   (触ると MMQ テンプレートインスタンス全体が再コンパイルされる)
+      # ============================================================
+
+      - name: Normalize timestamps for cache reuse
+        if: steps.build-cache.outputs.cache-matched-key != ''
+        shell: pwsh
+        run: |
+          $old = [datetime]::new(2020, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
+          $now = [datetime]::UtcNow
+
+          $count = 0
+          foreach ($path in @(git ls-files --recurse-submodules)) {
+              if (Test-Path -LiteralPath $path -PathType Leaf) {
+                  (Get-Item -LiteralPath $path).LastWriteTimeUtc = $old
+                  $count++
+              }
+          }
+          Write-Host "Source files normalized: $count"
+
+          $cudaInclude = Join-Path $env:CUDA_PATH "include"
+          if (-not (Test-Path $cudaInclude)) {
+              Write-Error "CUDA include directory not found: $cudaInclude"
+              exit 1
+          }
+
+          $count = 0
+          Get-ChildItem $cudaInclude -Recurse -File | ForEach-Object {
+              $_.LastWriteTimeUtc = $old
+              $count++
+          }
+          Write-Host "CUDA headers normalized: $count"
+
+          # ggml-backend.h は宣言追加のみ (構造体レイアウト不変) のため古い時刻のまま
+          # (触ると CUDA を含む全 TU が再コンパイルされる)。
+          # llama-context.h は llama_context にメンバ追加のためレイアウトが変わる。
+          foreach ($path in @(
+              "ggml/src/ggml-cuda/mmq.cu",
+              "tools/server/server-chat.cpp",
+              "tools/server/server-context.cpp",
+              "ggml/src/ggml-backend.cpp",
+              "src/llama-context.cpp",
+              "src/llama-context.h"
+          )) {
+              (Get-Item -LiteralPath $path).LastWriteTimeUtc = $now
+              Write-Host "Marked as changed: $path"
+          }
+
+
+      # ============================================================
+      # Configure
+      #
+      # RTX 3080 Ti       = sm86
+      # RTX 4070 Ti SUPER = sm89 (sm86 cubin で動作。CUDA は同一メジャー内で上位互換)
+      #
+      # sm75 / RTX 2080 Ti NOT included.
+      # ============================================================
+
+      - name: Configure BeeLlama
+        shell: cmd
+        run: |
+          set "VS_PATH=${{ steps.vs.outputs.path }}"
+
+          call "%VS_PATH%\VC\Auxiliary\Build\vcvarsall.bat" x64
+          if errorlevel 1 exit /b 1
+
+          echo =========================================
+          echo Compiler
+          echo =========================================
+
+          where cl
+          if errorlevel 1 exit /b 1
+
+          cl
+
+          echo =========================================
+          echo CUDA
+          echo =========================================
+
+          where nvcc
+          if errorlevel 1 exit /b 1
+
+          nvcc --version
+
+          echo =========================================
+          echo Ninja
+          echo =========================================
+
+          where ninja
+          if errorlevel 1 exit /b 1
+
+          ninja --version
+
+          echo =========================================
+          echo Configure
+          echo =========================================
+
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_CUDA=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CUDA_FA=ON ^
+            -DGGML_CUDA_FA_ALL_QUANTS=OFF ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DCMAKE_CUDA_ARCHITECTURES="86-real"
+
+          if errorlevel 1 exit /b 1
+
+
+      # ============================================================
+      # Verify CMake configuration
+      # ============================================================
+
+      - name: Verify CMake configuration
+        shell: pwsh
+        run: |
+          $cache = "build\CMakeCache.txt"
+
+          if (-not (Test-Path $cache)) {
+              Write-Error "CMakeCache.txt was not found."
+              exit 1
+          }
+
+          Write-Host "========================================="
+          Write-Host " CMake configuration"
+          Write-Host "========================================="
+
+          Select-String `
+              -Path $cache `
+              -Pattern "CMAKE_CUDA_ARCHITECTURES|GGML_CUDA_FA_ALL_QUANTS|GGML_CUDA_FA:|GGML_CUDA:"
+
+          $cuda = Select-String `
+              -Path $cache `
+              -Pattern "^GGML_CUDA:"
+
+          if (-not $cuda -or $cuda.Line -notmatch "=ON") {
+              Write-Error "GGML_CUDA is not ON."
+              exit 1
+          }
+
+          $fa = Select-String `
+              -Path $cache `
+              -Pattern "^GGML_CUDA_FA:"
+
+          if (-not $fa -or $fa.Line -notmatch "=ON") {
+              Write-Error "GGML_CUDA_FA is not ON."
+              exit 1
+          }
+
+          $allQuants = Select-String `
+              -Path $cache `
+              -Pattern "^GGML_CUDA_FA_ALL_QUANTS:"
+
+          if (-not $allQuants -or $allQuants.Line -notmatch "=OFF") {
+              Write-Error "GGML_CUDA_FA_ALL_QUANTS is not OFF."
+              exit 1
+          }
+
+          $arch = Select-String `
+              -Path $cache `
+              -Pattern "^CMAKE_CUDA_ARCHITECTURES"
+
+          if (-not $arch) {
+              Write-Error "CMAKE_CUDA_ARCHITECTURES was not found."
+              exit 1
+          }
+
+          Write-Host ""
+          Write-Host $arch.Line
+
+          if ($arch.Line -notmatch "=86-real$") {
+              Write-Error "Expected CUDA architectures 86-real only."
+              exit 1
+          }
+
+          Write-Host ""
+          Write-Host "CMake configuration OK."
+
+
+      # ============================================================
+      # Build llama-server only
+      # ============================================================
+
+      - name: Build llama-server
+        shell: cmd
+        run: |
+          set "VS_PATH=${{ steps.vs.outputs.path }}"
+
+          call "%VS_PATH%\VC\Auxiliary\Build\vcvarsall.bat" x64
+          if errorlevel 1 exit /b 1
+
+          echo =========================================
+          echo Build llama-server
+          echo =========================================
+
+          cmake --build build ^
+            --config Release ^
+            --target llama-server ^
+            --parallel
+
+          if errorlevel 1 exit /b 1
+
+
+      # ============================================================
+      # Save build cache immediately after successful build
+      #
+      # Before any runtime/version verification.
+      # ============================================================
+
+      - name: Save build cache
+        if: success() && steps.build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: build
+          key: beellama-4c007d272841-win2022-cuda133-sm86only-nvfp4off-mmqfix-faoff-tp-v1
+
+
+      # ============================================================
+      # Show build output
+      # ============================================================
+
+      - name: Show build output
+        shell: pwsh
+        run: |
+          Write-Host "========================================="
+          Write-Host " Build output"
+          Write-Host "========================================="
+
+          Get-ChildItem `
+              build `
+              -Recurse `
+              -File |
+              Where-Object {
+                  $_.Name -eq "llama-server.exe" -or
+                  $_.Extension -eq ".dll"
+              } |
+              Select-Object FullName
+
+
+      # ============================================================
+      # Show binary version
+      #
+      # Diagnostic only.
+      # NEVER kill artifact generation.
+      # ============================================================
+
+      - name: Show binary version
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $server = Get-ChildItem `
+              build `
+              -Recurse `
+              -Filter "llama-server.exe" `
+              -File |
+              Select-Object -First 1
+
+          if (-not $server) {
+              Write-Warning "llama-server.exe was not found."
+              exit 0
+          }
+
+          Write-Host "========================================="
+          Write-Host " Binary version"
+          Write-Host "========================================="
+
+          $out = (& $server.FullName --version 2>&1 | Out-String)
+
+          Write-Host $out
+
+          if ($out -notmatch '0\.4\.7') {
+              Write-Warning "Binary does not report version 0.4.7."
+              Write-Warning "Artifact creation will continue."
+          }
+
+          if ($out -notmatch '4c007d2') {
+              Write-Warning "Binary does not report commit 4c007d2."
+              Write-Warning "Artifact creation will continue."
+          }
+
+
+      # ============================================================
+      # Verify -ubd
+      #
+      # Diagnostic only.
+      # Artifact creation continues on failure.
+      # ============================================================
+
+      - name: Verify draft ubatch option
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $server = Get-ChildItem `
+              build `
+              -Recurse `
+              -Filter "llama-server.exe" `
+              -File |
+              Select-Object -First 1
+
+          if (-not $server) {
+              Write-Error "llama-server.exe was not found."
+              exit 1
+          }
+
+          $helpOutput = (& $server.FullName --help 2>&1 | Out-String)
+
+          Write-Host "========================================="
+          Write-Host " Draft ubatch"
+          Write-Host "========================================="
+
+          $helpOutput -split "`r?`n" |
+              Select-String `
+                  -Pattern "spec-draft-ubatch-size|-ubd" |
+              ForEach-Object {
+                  Write-Host $_.Line
+              }
+
+          if ($helpOutput -notmatch "spec-draft-ubatch-size") {
+              Write-Error "--spec-draft-ubatch-size / -ubd was NOT found."
+              exit 1
+          }
+
+          Write-Host ""
+          Write-Host "OK: -ubd is available."
+
+
+      # ============================================================
+      # Create package
+      #
+      # Runs even if version / -ubd diagnostics fail.
+      # ============================================================
+
+      - name: Create package
+        if: always()
+        shell: pwsh
+        run: |
+          $package = "package"
+
+          Remove-Item `
+              $package `
+              -Recurse `
+              -Force `
+              -ErrorAction SilentlyContinue
+
+          New-Item `
+              -ItemType Directory `
+              -Path $package `
+              -Force |
+              Out-Null
+
+
+          $server = Get-ChildItem `
+              build `
+              -Recurse `
+              -Filter "llama-server.exe" `
+              -File `
+              -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+
+          if (-not $server) {
+              Write-Warning "llama-server.exe was not found."
+              exit 0
+          }
+
+          $bin = $server.Directory.FullName
+
+          Write-Host "Binary directory:"
+          Write-Host $bin
+
+
+          # --------------------------------------------------------
+          # EXE
+          # --------------------------------------------------------
+
+          Copy-Item `
+              $server.FullName `
+              -Destination $package `
+              -Force
+
+
+          # --------------------------------------------------------
+          # DLLs
+          # --------------------------------------------------------
+
+          Get-ChildItem `
+              $bin `
+              -Filter "*.dll" `
+              -File `
+              -ErrorAction SilentlyContinue |
+              Copy-Item `
+                  -Destination $package `
+                  -Force
+
+
+          # --------------------------------------------------------
+          # Source information
+          # --------------------------------------------------------
+
+          git rev-parse HEAD |
+              Out-File `
+                  "$package\source-commit.txt" `
+                  -Encoding ascii
+
+          git describe --tags --always |
+              Out-File `
+                  "$package\source-version.txt" `
+                  -Encoding ascii
+
+
+          # --------------------------------------------------------
+          # Complete patch
+          #
+          # Includes:
+          #
+          # Codex patch
+          # NVFP4 .cu deletion
+          # NVFP4 declaration removal
+          # NVFP4 dispatch removal
+          # --------------------------------------------------------
+
+          git diff |
+              Out-File `
+                  "$package\build-patches.patch" `
+                  -Encoding utf8
+
+
+          # --------------------------------------------------------
+          # Binary version
+          # --------------------------------------------------------
+
+          (& $server.FullName --version 2>&1 | Out-String) |
+              Out-File `
+                  "$package\llama-server-version.txt" `
+                  -Encoding utf8
+
+
+          # --------------------------------------------------------
+          # Draft options
+          # --------------------------------------------------------
+
+          $helpOutput = (& $server.FullName --help 2>&1 | Out-String)
+
+          $helpOutput -split "`r?`n" |
+              Select-String `
+                  -Pattern "spec-draft|draft-device|draft-ngl|ubd" |
+              ForEach-Object {
+                  $_.Line
+              } |
+              Out-File `
+                  "$package\draft-options.txt" `
+                  -Encoding utf8
+
+
+          # --------------------------------------------------------
+          # CUDA version
+          # --------------------------------------------------------
+
+          (& nvcc --version 2>&1 | Out-String) |
+              Out-File `
+                  "$package\cuda-version.txt" `
+                  -Encoding utf8
+
+
+          # --------------------------------------------------------
+          # Visual Studio
+          # --------------------------------------------------------
+
+          @"
+          ${{ steps.vs.outputs.path }}
+          "@ |
+              Out-File `
+                  "$package\visual-studio-path.txt" `
+                  -Encoding utf8
+
+
+          # --------------------------------------------------------
+          # Build information
+          # --------------------------------------------------------
+
+          @"
+          BeeLlama v0.4.7 Preview pinned build + TurboPrefill port (TURBOPREFILL=1 で有効)
+          =====================================
+
+          Source:
+          Anbeeld/beellama.cpp
+
+          Commit:
+          4c007d272841
+
+          CUDA:
+          13.3
+
+          CUDA architectures:
+
+          86-real
+          RTX 3080 Ti
+          RTX 4070 Ti SUPER (sm89, sm86 cubin で動作)
+
+          sm75 / RTX 2080 Ti:
+          NOT INCLUDED
+
+          Build target:
+          llama-server only
+
+          NVFP4 MMQ:
+          DISABLED
+
+          Removed:
+          ggml/src/ggml-cuda/template-instances/mmq-instance-nvfp4.cu
+
+          Removed declaration:
+          DECL_MMQ_CASE(GGML_TYPE_NVFP4)
+
+          Removed dispatcher:
+          case GGML_TYPE_NVFP4 (ggml_cuda_mul_mat_q_switch_type block + ggml_cuda_should_use_mmq label only; MMQ kept for other types)
+
+          Build options:
+
+          GGML_CUDA=ON
+          GGML_NATIVE=OFF
+          GGML_CUDA_FA=ON
+          GGML_CUDA_FA_ALL_QUANTS=OFF
+          LLAMA_BUILD_TESTS=OFF
+
+          CMAKE_CUDA_ARCHITECTURES=86-real
+
+          Required BeeLlama option:
+
+          --spec-draft-ubatch-size
+          -ubd
+
+          Codex Responses API compatibility:
+
+          raw string
+          input_text
+          output_text
+          text
+          input_image
+          "@ |
+              Out-File `
+                  "$package\BUILD-INFO.txt" `
+                  -Encoding utf8
+
+
+          Write-Host "========================================="
+          Write-Host " Package contents"
+          Write-Host "========================================="
+
+          Get-ChildItem `
+              $package `
+              -File |
+              Sort-Object Name |
+              Select-Object Name, Length
+
+
+      # ============================================================
+      # Create ZIP
+      # ============================================================
+
+      - name: Create ZIP
+        if: always()
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "package\llama-server.exe")) {
+              Write-Warning "No llama-server.exe to package."
+              exit 0
+          }
+
+          $zip = "beellama-preview-v0.4.7-4c007d272841-ubd-codex-cuda13.3-sm86only-no-nvfp4-mmqfix-turboprefill.zip"
+
+          Remove-Item `
+              $zip `
+              -Force `
+              -ErrorAction SilentlyContinue
+
+          Compress-Archive `
+              -Path package\* `
+              -DestinationPath $zip `
+              -Force
+
+          Write-Host "========================================="
+          Write-Host " ZIP"
+          Write-Host "========================================="
+
+          Get-Item $zip |
+              Select-Object `
+                  Name,
+                  @{N="MiB";E={[math]::Round($_.Length / 1MB, 2)}}
+
+
+      # ============================================================
+      # Upload ZIP artifact
+      #
+      # Runs even if diagnostics failed.
+      # ============================================================
+
+      - name: Upload ZIP artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: beellama-preview-v0.4.7-4c007d272841-ubd-codex-cuda13.3-sm86only-no-nvfp4-mmqfix-turboprefill
+          path: beellama-preview-v0.4.7-4c007d272841-ubd-codex-cuda13.3-sm86only-no-nvfp4-mmqfix-turboprefill.zip
+          if-no-files-found: warn
+          retention-days: 14
+
+
+      # ============================================================
+      # Emergency raw artifact
+      #
+      # If ZIP/package logic fails after successful compilation,
+      # preserve EXE + DLLs directly.
+      # ============================================================
+
+      - name: Upload raw build output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: beellama-raw-build-4c007d272841-cuda13.3-sm86only-no-nvfp4-mmqfix-turboprefill
+          path: |
+            build/bin/Release/llama-server.exe
+            build/bin/Release/*.dll
+            build/bin/llama-server.exe
+            build/bin/*.dll
+          if-no-files-found: warn
+          retention-days: 14
